@@ -1,6 +1,6 @@
 # ToolOrchestra: Elevating Intelligence via Efficient Model and Tool Orchestration
 
-[![Paper](https://img.shields.io/badge/ArXiv-Paper-brown)](https://arxiv.org/abs/xxx)
+[![Paper](https://img.shields.io/badge/ArXiv-Paper-brown)](https://arxiv.org/abs/2511.21689)
 [![Code](https://img.shields.io/badge/GitHub-Link-orange)](https://github.com/NVlabs/ToolOrchestra/)
 [![Model](https://img.shields.io/badge/HuggingFace-Model-green)](https://huggingface.co/nvidia/Orchestrator-8B)
 [![Data](https://img.shields.io/badge/HuggingFace-Data-blue)](https://huggingface.co/datasets/nvidia/ToolScale)
@@ -110,11 +110,16 @@ The code included in this project is licensed under the [Apache 2.0 license](htt
 
 ## Citation
 
-If you find this repository useful, please consider giving ⭐ and citing our paper:
+If you find this repository useful, please consider giving ⭐ and citing our [paper](https://arxiv.org/abs/2511.21689):
 
 ```citation
-@misc{ToolOrchestra,
-  title={ToolOrchestra: Elevating Intelligence via Efficient Model and Tool Orchestration},
-  author={Su, Hongjin and Diao, Shizhe and Lu, Ximing and Liu, Mingjie and Xu, Jiacheng and Dong, Xin and Fu, Yonggan and Belcak, Peter and Ye, Hanrong and Yin, Hongxu and Dong, Yi and Bakhturina, Evelina and Yu, Tao and Choi, Yejin and Kautz, Jan and Molchanov, Pavlo}
-  year={2025}
+@misc{toolorchestra,
+      title={ToolOrchestra: Elevating Intelligence via Efficient Model and Tool Orchestration}, 
+      author={Hongjin Su and Shizhe Diao and Ximing Lu and Mingjie Liu and Jiacheng Xu and Xin Dong and Yonggan Fu and Peter Belcak and Hanrong Ye and Hongxu Yin and Yi Dong and Evelina Bakhturina and Tao Yu and Yejin Choi and Jan Kautz and Pavlo Molchanov},
+      year={2025},
+      eprint={2511.21689},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2511.21689}, 
+}
 ```
