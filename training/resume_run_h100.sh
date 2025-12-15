@@ -5,16 +5,16 @@
 #SBATCH --time 04:00:00
 #SBATCH --nodes 2
 #SBATCH --gpus-per-node=8
-#SBATCH --job-name run
+#SBATCH --job-name train_orchestrator
 #SBATCH --ntasks-per-node=1
 #SBATCH --mem=0
 #SBATCH --overcommit
 #SBATCH --exclusive
 #SBATCH --dependency=singleton
+#SBATCH --output=train_orchestrator.out
+#SBATCH --error=train_orchestrator.err
 
 set -x
-
-
 
 ROLLOUT=8
 ALGO="grpo"
@@ -39,13 +39,13 @@ LENGTH_PENALTY_TYPE="cosine"
 export RAY_USAGE_STATS_ENABLED=0
 export RAY_DISABLE_DOCKER_CPU_WARNING=1
 
-export WANDB_API_KEY="YOUR_WANDB_KEY"
+# export WANDB_API_KEY="YOUR_WANDB_KEY"
+# export CLIENT_ID="CLIENT_ID"
+# export CLIENT_SECRET="CLIENT_SECRET"
+
 MODEL_PATH="Qwen/Qwen3-8B"
 MODEL_TYPE="Qwen/Qwen3-8B"
-GPFS="train"
-
-export CLIENT_ID="CLIENT_ID"
-export CLIENT_SECRET="CLIENT_SECRET"
+GPFS="/lustre/fsw/portfolios/nvr/users/sdiao/toolorchestra_code/ToolOrchestra/training/verl"
 
 TRAIN_DATA="['data.jsonl']"
 
@@ -59,7 +59,7 @@ TRANSFER_DIR="outputs/orchestra/transfer"
 mkdir -p $RESULTS_DIR
 mkdir -p $CKPT_DIR
 
-MAIN_CONTAINER="verl/image/path"
+MAIN_CONTAINER="/lustre/fsw/portfolios/nvr/users/hongjins/containers/s1.sqsh"
 
 MOUNTS="--container-mounts=${GPFS}:${GPFS},/lustre:/lustre,${GPFS}:/verl"
 

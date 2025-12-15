@@ -1,8 +1,8 @@
 #!/bin/bash
 
 #SBATCH --account nvr_lpr_llm
-#SBATCH --partition batch_block1,batch_short
-#SBATCH --time 04:00:00
+#SBATCH --partition interactive,batch_short,batch_singlenode,batch_block1,backfill
+#SBATCH --time 02:00:00
 #SBATCH --nodes 1
 #SBATCH --gpus-per-node=8
 #SBATCH --job-name se_t4_3
@@ -18,6 +18,7 @@ set -x
 
 hostname -i
 source ~/.bashrc
+
 conda activate vllm1
 CUDA_VISIBLE_DEVICES=0 vllm serve google/gemma-2-9b-it --port 1409 &
 CUDA_VISIBLE_DEVICES=1 vllm serve codellama/CodeLlama-7b-Instruct-hf --port 1410 &

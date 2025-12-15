@@ -430,8 +430,8 @@ args.tavily_key = tavily_key
 
 config = Config(
     retrieval_method='qwen',  # or "dense"
-    index_path=os.path.join(os.environ.get('INDEX_FILE',None),'train.index'),
-    corpus_path=os.path.join(os.environ.get('INDEX_FILE',None),'train.jsonl'),
+    index_path=os.path.join(os.environ.get('INDEX_DIR',None),'train.index'),
+    corpus_path=os.path.join(os.environ.get('INDEX_DIR',None),'train.jsonl'),
     retrieval_topk=5,
     faiss_gpu=True,
     retrieval_model_path='Qwen/Qwen3-Embedding-8B',
