@@ -1,8 +1,8 @@
 #!/bin/bash
 
 #SBATCH --account nvr_lpr_llm
-#SBATCH --partition batch_block1,interactive
-#SBATCH --time 04:00:00
+#SBATCH --partition interactive,batch_short,batch_singlenode,batch_block1,backfill
+#SBATCH --time 02:00:00
 #SBATCH --nodes 2
 #SBATCH --gpus-per-node=8
 #SBATCH --job-name train_orchestrator
@@ -45,7 +45,7 @@ export RAY_DISABLE_DOCKER_CPU_WARNING=1
 
 MODEL_PATH="Qwen/Qwen3-8B"
 MODEL_TYPE="Qwen/Qwen3-8B"
-GPFS="/lustre/fsw/portfolios/nvr/users/sdiao/toolorchestra_code/ToolOrchestra/training/verl"
+GPFS="/lustre/fsw/portfolios/nvr/users/sdiao/toolorchestra_code/ToolOrchestra/training"
 
 TRAIN_DATA="['data.jsonl']"
 
@@ -59,7 +59,7 @@ TRANSFER_DIR="outputs/orchestra/transfer"
 mkdir -p $RESULTS_DIR
 mkdir -p $CKPT_DIR
 
-MAIN_CONTAINER="/lustre/fsw/portfolios/nvr/users/hongjins/containers/s1.sqsh"
+MAIN_CONTAINER="/lustre/fsw/portfolios/nvr/users/sdiao/docker/s1.sqsh"
 
 MOUNTS="--container-mounts=${GPFS}:${GPFS},/lustre:/lustre,${GPFS}:/verl"
 
@@ -108,7 +108,7 @@ srun --overlap --nodes=1 --ntasks=1 -w $head_node -o "$RESULTS_DIR/checker-%j-he
 
 srun --overlap --nodes=1 --ntasks=1 -w $head_node -o "$RESULTS_DIR/command-%j-head-node.out" -e "$RESULTS_DIR/command-%j-head-node.err" --no-container-mount-home --container-image="$MAIN_CONTAINER" $MOUNTS $EXPORTS bash -c \
 "ray status && lscpu && ray job submit --address=http://localhost:8265 \
-    --runtime-env-json='{\"working_dir\": \"/verl\"}' \
+    --runtime-env-json='{\"working_dir\": \"/verl\", \"excludes\": [\"**/general_thought_example_urls.json\",\"**/train_hle_all\"]}' \
     -- python3 -u -m recipe.algo.main_grpo_quick3 \
     +data.shuffle_train_dataloader=True \
     algorithm.adv_estimator=$ALGO \
