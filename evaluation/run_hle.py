@@ -40,9 +40,10 @@ set -x
 
 hostname -i
 export HF_HOME=cache/huggingface
-conda activate retriever
+source /lustre/fsw/portfolios/nvr/users/sdiao/anaconda3/bin/activate retriever
 CUDA_VISIBLE_DEVICES=0 python retrieval_hle.py --port 1401 &
-conda activate vllm1
+
+source /lustre/fsw/portfolios/nvr/users/sdiao/anaconda3/bin/activate vllm1
 CUDA_VISIBLE_DEVICES=1,2,3,4 vllm serve Qwen/Qwen2.5-Math-72B-Instruct --port 1402 --tensor-parallel-size 4 &
 CUDA_VISIBLE_DEVICES=5,6 vllm serve Qwen/Qwen3-32B --port 1403 --tensor-parallel-size 2 &
 CUDA_VISIBLE_DEVICES=7 vllm serve Qwen/Qwen2.5-Math-7B-Instruct --port 1404
@@ -69,7 +70,7 @@ set -x
 
 hostname -i
 export HF_HOME=cache/huggingface
-conda activate vllm1
+source /lustre/fsw/portfolios/nvr/users/sdiao/anaconda3/bin/activate vllm1
 CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve meta-llama/Llama-3.3-70B-Instruct --port 1405 --tensor-parallel-size 4 &
 CUDA_VISIBLE_DEVICES=4 vllm serve checkpoint_dir --enable-auto-tool-choice --tool-call-parser hermes --port 1406 &
 CUDA_VISIBLE_DEVICES=6,7 vllm serve Qwen/Qwen2.5-Coder-32B-Instruct --port 1407 --tensor-parallel-size 2
@@ -241,13 +242,11 @@ while True:
                     "ip_addr": sip,
                     "port": "1407"
                 })
+        os.makedirs('model_configs', exist_ok=True)
         with open('model_configs/serve2.json','w') as f:
             json.dump(model_config,f,indent=2)
 
     cur_output_dir = output_dir
-    os.system(f"python eval_hle.py --model_name {cur_ckpt_dir} --output_dir {cur_output_dir} --model_config model_configs/serve2.json --example_path hle.jsonl")
+    # os.system(f"python eval_hle.py --model_name {cur_ckpt_dir} --output_dir {cur_output_dir} --model_config model_configs/serve2.json --example_path hle.jsonl")
 
     time.sleep(30)
-
-        
-
