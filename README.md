@@ -75,8 +75,20 @@ export CLIENT_ID="CLIENT_ID"
 export CLIENT_SECRET="CLIENT_SECRET"
 
 ```
+# For Tau2-Bench Evaluation (Enroot Environment)
 
-### Environment for Training
+You need to re-build the image because it requires local installation of tau2:
+
+```bash
+srun --partition=interactive --time=04:00:00 --nodes=1 --overcommit --ntasks-per-node=1 --cpus-per-task=128 --job-name tau2-bench --account=nvr_lpr_agentic --gres=gpu:8  --container-image /lustre/fsw/portfolios/nvr/users/$USER/docker/s1.sqsh --container-save /lustre/fsw/portfolios/nvr/users/$USER/docker/s1.sqsh --container-mounts=$HOME:/home,/lustre:/lustre --pty /bin/bash
+
+pip uninstall -y tau2
+cd toolorchestra/evaluation/tau2-bench
+pip install -e .
+exit
+```
+
+### Environment for Training (Conda Environment)
 
 ```bash
 conda create -n toolorchestra python=3.12 -y
