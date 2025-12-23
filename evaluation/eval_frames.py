@@ -43,8 +43,8 @@ with open('tools.json') as f:
     raw_tools = json.load(f)
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
 oss_client = OpenAI(
-  base_url = "https://integrate.api.nvidia.com/v1",
-  api_key = os.getenv("OSS_KEY")
+  base_url = "https://api.together.xyz/v1",
+  api_key = os.getenv("TOGETHER_API_KEY")
 )
 
 MODEL_MAPPING = {
@@ -185,7 +185,7 @@ def call_tool(arguments):
                 while not response:
                     try:
                         response = oss_client.chat.completions.create(
-                            model="nvdev/qwen/qwen2.5-coder-32b-instruct", 
+                            model="Qwen/Qwen2.5-Coder-32B-Instruct", 
                             messages=[{"role":"user","content":prompt}],temperature=0.2,
                             top_p=0.7,
                             max_tokens=8000,
@@ -295,7 +295,7 @@ def call_tool(arguments):
                 while not response:
                     try:
                         response = client.chat.completions.create(
-                            model="nvdev/meta/llama-3.3-70b-instruct", 
+                            model="meta-llama/Llama-3.3-70B-Instruct", 
                             messages=[{"role":"user","content":prompt}],temperature=0.2,
                             top_p=0.7,
                             max_tokens=40000,
