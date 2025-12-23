@@ -272,8 +272,14 @@ def get_claude_token():
 
 
 def get_openai_client(model):
+    api_key = os.getenv("OPENAI_API_KEY")
+    if api_key:
+        return OpenAI(api_key=api_key)
+
     client_id = os.getenv("CLIENT_ID")
     client_secret = os.getenv("CLIENT_SECRET")
+    if not client_id or not client_secret:
+        raise ValueError("CLIENT_ID/CLIENT_SECRET are required when OPENAI_API_KEY is not set.")
     token_url = "https://prod.api.nvidia.com/oauth/api/v1/ssa/default/token"
     scope = "azureopenai-readwrite"
     token = get_openai_token(token_url, client_id, client_secret, scope)
@@ -325,8 +331,8 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
         while answer=='':
             try:
                 oss_client = OpenAI(
-                    base_url = "https://integrate.api.nvidia.com/v1",
-                    api_key = os.getenv("OSS_KEY")
+                    base_url = "https://api.together.xyz/v1",
+                    api_key = os.getenv("TOGETHER_API_KEY")
                 )
                 if tools:
                     chat_completion = oss_client.chat.completions.create(
@@ -436,5 +442,4 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
             except Exception as error:
                 time.sleep(60)
         return answer
-
 
