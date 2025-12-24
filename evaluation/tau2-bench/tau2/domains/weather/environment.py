@@ -7,6 +7,7 @@ from tau2.data_model.tasks import Task
 from tau2.domains.weather.data_model import WeatherDB
 from tau2.domains.weather.tools import WeatherTools
 from tau2.environment.environment import Environment
+from tau2.utils import DATA_DIR
 
 
 def get_environment(
@@ -16,9 +17,9 @@ def get_environment(
     if solo_mode:
         raise ValueError("Weather domain does not support solo mode")
     if db is None:
-        db = WeatherDB.load('../data_dir/tau2/domains/weather/db.json')
+        db = WeatherDB.load(str(DATA_DIR / "tau2" / "domains" / "weather" / "db.json"))
     tools = WeatherTools(db)
-    with open('../data_dir/tau2/domains/weather/policy.md', "r") as fp:
+    with open(str(DATA_DIR / "tau2" / "domains" / "weather" / "policy.md"), "r") as fp:
         policy = fp.read()
     return Environment(
         domain_name="weather",

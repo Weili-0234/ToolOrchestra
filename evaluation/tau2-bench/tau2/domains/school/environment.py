@@ -7,6 +7,7 @@ from tau2.data_model.tasks import Task
 from tau2.domains.school.data_model import SchoolDB
 from tau2.domains.school.tools import SchoolTools
 from tau2.environment.environment import Environment
+from tau2.utils import DATA_DIR
 
 
 def get_environment(
@@ -16,9 +17,9 @@ def get_environment(
     if solo_mode:
         raise ValueError("School domain does not support solo mode")
     if db is None:
-        db = SchoolDB.load('../data_dir/tau2/domains/school/db.json')
+        db = SchoolDB.load(str(DATA_DIR / "tau2" / "domains" / "school" / "db.json"))
     tools = SchoolTools(db)
-    with open('../data_dir/tau2/domains/school/policy.md', "r") as fp:
+    with open(str(DATA_DIR / "tau2" / "domains" / "school" / "policy.md"), "r") as fp:
         policy = fp.read()
     return Environment(
         domain_name="school",

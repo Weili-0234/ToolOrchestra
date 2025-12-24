@@ -7,6 +7,7 @@ from tau2.data_model.tasks import Task
 from tau2.domains.bank.data_model import BankDB
 from tau2.domains.bank.tools import BankTools
 from tau2.environment.environment import Environment
+from tau2.utils import DATA_DIR
 
 
 def get_environment(
@@ -16,9 +17,9 @@ def get_environment(
     if solo_mode:
         raise ValueError("Bank domain does not support solo mode")
     if db is None:
-        db = BankDB.load('../data_dir/tau2/domains/bank/db.json')
+        db = BankDB.load(str(DATA_DIR / 'tau2' / 'domains' / 'bank' / 'db.json'))
     tools = BankTools(db)
-    with open('../data_dir/tau2/domains/bank/policy.md', "r") as fp:
+    with open(str(DATA_DIR / 'tau2' / 'domains' / 'bank' / 'policy.md'), "r") as fp:
         policy = fp.read()
     return Environment(
         domain_name="bank",

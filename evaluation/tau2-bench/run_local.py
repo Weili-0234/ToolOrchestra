@@ -13,9 +13,10 @@ import signal
 import argparse
 import subprocess
 import requests
+import selectors
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 def log(msg: str):
     """Print timestamped log message"""
@@ -200,12 +201,17 @@ def get_available_gpus() -> int:
 def run_evaluation(domain: str, agent_llm: str, user_llm: str,
                    task_path: str, output_file: str, model_config_path: str,
                    max_steps: int = 200, num_trials: int = 1,
-                   use_model_tool: bool = True):
+                   use_model_tool: bool = False, max_concurrency: int = 10,
+                   num_tasks: Optional[int] = None, max_errors: int = 10,
+                   seed: int = 300, log_level: str = "ERROR",
+                   log_dir: str = "logs",
+                   overall_state: Optional[Dict[str, Any]] = None):
     """Run tau2-bench evaluation for a specific domain"""
     log(f"========== Starting evaluation: {domain.upper()} ==========")
 
+    # Use the current interpreter to ensure we're running inside the active conda env (e.g. vllm1)
     cmd = [
-        "python", "tau2/cli.py",
+        sys.executable, "-m", "tau2.cli",
         "--domain", domain,
         "--agent-llm", agent_llm,
         "--user-llm", user_llm,
@@ -214,7 +220,13 @@ def run_evaluation(domain: str, agent_llm: str, user_llm: str,
         "--max-steps", str(max_steps),
         "--output_file", output_file,
         "--model_config_path", model_config_path,
+        "--max-concurrency", str(max_concurrency),
+        "--max-errors", str(max_errors),
+        "--seed", str(seed),
+        "--log-level", log_level,
     ]
+    if num_tasks is not None:
+        cmd += ["--num-tasks", str(num_tasks)]
 
     if use_model_tool:
         cmd.append("--use_model_tool")
@@ -224,40 +236,130 @@ def run_evaluation(domain: str, agent_llm: str, user_llm: str,
     log(f"Checking task path: {task_path} (exists: {os.path.exists(task_path)})")
     
     # Capture output to print progress
-    process = subprocess.Popen(
-        cmd,
-        cwd=os.getcwd(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1
-    )
-    
-    log(f"Process started with PID: {process.pid}")
-    
-    # Read output in real-time
-    while True:
-        # Check if process is still running
-        retcode = process.poll()
+    env = os.environ.copy()
+    # Ensure child python prints are flushed promptly (avoids "looks hung" due to buffering)
+    env["PYTHONUNBUFFERED"] = "1"
+
+    # Stream structured tau2 logging to a per-domain file (append) so logs survive cancellation.
+    os.makedirs(log_dir, exist_ok=True)
+    env["TAU2_LOG_FILE"] = os.path.join(log_dir, f"tau2_{domain}.log")
+
+    eval_log_path = os.path.join(log_dir, f"eval_{domain}.log")
+
+    def _fmt_hms(seconds: float) -> str:
+        if seconds < 0:
+            seconds = 0
+        s = int(seconds)
+        h = s // 3600
+        m = (s % 3600) // 60
+        s = s % 60
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
+    def _print_overall_eta() -> None:
+        if not overall_state:
+            return
+        total = int(overall_state.get("total") or 0)
+        done = int(overall_state.get("done") or 0)
+        start_ts = float(overall_state.get("start_ts") or time.time())
+        now_ts = time.time()
+        elapsed_s = max(0.0, now_ts - start_ts)
+        if total <= 0 or done <= 0:
+            return
+        remaining = max(0, total - done)
+        per_task = elapsed_s / done
+        eta_s = per_task * remaining
+        # Red ANSI line for terminal
+        print(
+            "\033[31m"
+            f"[OVERALL_ETA] done={done}/{total} elapsed={_fmt_hms(elapsed_s)} eta={_fmt_hms(eta_s)}"
+            "\033[0m",
+            flush=True,
+        )
+
+    with open(eval_log_path, "a", encoding="utf-8", buffering=1) as eval_log:
+        process = subprocess.Popen(
+            cmd,
+            cwd=os.getcwd(),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1
+        )
         
-        # Read available output
-        for line in iter(process.stdout.readline, ''):
-            print(f"[tau2/cli.py STDOUT] {line.strip()}", flush=True)
-            
-        for line in iter(process.stderr.readline, ''):
-            print(f"[tau2/cli.py STDERR] {line.strip()}", flush=True)
-            
-        if retcode is not None:
-            break
-            
-        time.sleep(0.1)
+        log(f"Process started with PID: {process.pid}")
+        
+        # Read output in real-time without blocking on readline() when the child is quiet.
+        selector = selectors.DefaultSelector()
+        if process.stdout is not None:
+            selector.register(process.stdout, selectors.EVENT_READ, data="STDOUT")
+        if process.stderr is not None:
+            selector.register(process.stderr, selectors.EVENT_READ, data="STDERR")
 
-    if retcode == 0:
-        log(f"========== Finished {domain.upper()} evaluation successfully ==========")
-    else:
-        log(f"========== {domain.upper()} evaluation failed with code {retcode} ==========")
+        retcode: Optional[int] = None
+        last_output_ts = time.time()
+        last_heartbeat_ts = last_output_ts
 
-    return retcode
+        while True:
+            retcode = process.poll()
+
+            events = selector.select(timeout=0.2)
+            for key, _mask in events:
+                stream_name = key.data
+                fileobj = key.fileobj
+                try:
+                    line = fileobj.readline()
+                except Exception as e:
+                    log(f"WARNING: Failed reading {stream_name}: {e}")
+                    try:
+                        selector.unregister(fileobj)
+                    except Exception:
+                        pass
+                    continue
+
+                if line:
+                    last_output_ts = time.time()
+
+                    # Append to per-domain eval log (streaming, survives cancellation)
+                    try:
+                        eval_log.write(f"[tau2/cli.py {stream_name}] {line}")
+                        eval_log.flush()
+                    except Exception:
+                        # Best-effort: never break the main flow due to log I/O.
+                        pass
+
+                    # Detect task-complete marker from child to update overall ETA.
+                    raw = line.rstrip("\n")
+                    if raw.startswith("[TAU2_TASK_COMPLETE]") and overall_state is not None:
+                        overall_state["done"] = int(overall_state.get("done") or 0) + 1
+                        _print_overall_eta()
+
+                    print(f"[tau2/cli.py {stream_name}] {line.rstrip()}", flush=True)
+                else:
+                    # EOF on this stream
+                    try:
+                        selector.unregister(fileobj)
+                    except Exception:
+                        pass
+
+            # Heartbeat so users can distinguish "no output yet" from "stuck"
+            now = time.time()
+            if retcode is None and (now - last_heartbeat_ts) > 30 and (now - last_output_ts) > 30:
+                last_heartbeat_ts = now
+                log(f"{domain.upper()} still running (pid={process.pid}); no output for {int(now - last_output_ts)}s...")
+
+            # Exit when process ended and we've drained both pipes
+            if retcode is not None and not selector.get_map():
+                break
+
+        if retcode == 0:
+            log(f"========== Finished {domain.upper()} evaluation successfully ==========")
+        else:
+            log(f"========== {domain.upper()} evaluation failed with code {retcode} ==========")
+
+        return retcode
 
 def main():
     parser = argparse.ArgumentParser(
@@ -289,8 +391,8 @@ Example usage:
     parser.add_argument(
         "--user-llm",
         type=str,
-        default="gpt-4o",
-        help="LLM to use for user simulation (default: gpt-4o, requires OPENAI_API_KEY)"
+        default="gpt-5",
+        help="LLM to use for user simulation (default: gpt-5, requires OPENAI_API_KEY). Use gpt-5 to match tau2-bench baseline."
     )
 
     # Server configuration
@@ -332,8 +434,8 @@ Example usage:
         type=str,
         nargs="+",
         default=["retail", "telecom", "airline"],
-        choices=["retail", "telecom", "airline"],
-        help="Domains to evaluate (default: retail telecom airline)"
+        choices=["mock", "retail", "telecom", "airline"],
+        help="Domains to evaluate (default: retail telecom airline). Only these domains have task files available."
     )
     parser.add_argument(
         "--max-steps",
@@ -346,6 +448,49 @@ Example usage:
         type=int,
         default=1,
         help="Number of trials per task (default: 1)"
+    )
+    parser.add_argument(
+        "--num-tasks",
+        type=int,
+        default=None,
+        help="Run only the first N tasks (smoke test). If unset, runs all tasks."
+    )
+    parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=10,
+        help="Maximum number of concurrent tasks (default: 10). For debugging with a single local vLLM server, use 1."
+    )
+    parser.add_argument(
+        "--use_model_tool",
+        action="store_true",
+        default=True,
+        help="Enable model-tool behavior (e.g., call_expert) during agent rollout. Default: enabled to match run.py baseline."
+    )
+    parser.add_argument(
+        "--no-use-model-tool",
+        dest="use_model_tool",
+        action="store_false",
+        help="Disable model-tool behavior (call_expert will not be available)."
+    )
+    parser.add_argument(
+        "--max-errors",
+        type=int,
+        default=10,
+        help="Maximum number of tool errors allowed in a row (default: 10). Matches tau2-bench baseline."
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=300,
+        help="Random seed for reproducibility (default: 300). Matches tau2-bench baseline."
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "PROFILE", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Log level for tau2 simulation (default: INFO). PROFILE enables tool/LLM call timing."
     )
     parser.add_argument(
         "--output-dir",
@@ -472,6 +617,7 @@ Example usage:
     # Run evaluations
     try:
         task_paths = {
+            "mock": os.path.join(repo_path, "data/tau2/domains/mock/tasks.json"),
             "retail": os.path.join(repo_path, "data/tau2/domains/retail/tasks.json"),
             "telecom": os.path.join(repo_path, "data/tau2/domains/telecom/tasks.json"),
             "airline": os.path.join(repo_path, "data/tau2/domains/airline/original_tasks.json"),
@@ -483,6 +629,32 @@ Example usage:
                 log(f"ERROR: Task file not found: {task_paths[domain]}")
                 manager.stop_all()
                 sys.exit(1)
+
+        # Compute overall total tasks across requested domains (for red overall ETA).
+        def _count_tasks_in_file(path: str) -> int:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return len(data)
+                if isinstance(data, dict) and "tasks" in data and isinstance(data["tasks"], list):
+                    return len(data["tasks"])
+            except Exception:
+                pass
+            return 0
+
+        overall_total = 0
+        for domain in args.domains:
+            n = _count_tasks_in_file(task_paths[domain])
+            if args.num_tasks is not None:
+                n = min(n, args.num_tasks)
+            overall_total += n * args.num_trials
+
+        overall_state: Dict[str, Any] = {
+            "total": overall_total,
+            "done": 0,
+            "start_ts": time.time(),
+        }
 
         results = {}
         for domain in args.domains:
@@ -497,7 +669,14 @@ Example usage:
                 model_config_path=args.model_config_path,
                 max_steps=args.max_steps,
                 num_trials=args.num_trials,
-                use_model_tool=True
+                use_model_tool=args.use_model_tool,
+                max_concurrency=args.max_concurrency,
+                num_tasks=args.num_tasks,
+                max_errors=args.max_errors,
+                seed=args.seed,
+                log_level=args.log_level,
+                log_dir=args.log_dir,
+                overall_state=overall_state,
             )
 
             results[domain] = "SUCCESS" if returncode == 0 else "FAILED"

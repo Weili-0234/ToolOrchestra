@@ -4,6 +4,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 import os
+from pathlib import Path
 from deepdiff import DeepDiff
 from dotenv import load_dotenv
 from loguru import logger
@@ -13,7 +14,29 @@ res = load_dotenv()
 #     logger.warning("No .env file found")
 
 # DATA_DIR = Path('data_dir')
-data_dir = os.path.join(os.environ.get('REPO_PATH'), 'evaluation/data_dir')
+# `tau2` historically relied on REPO_PATH being exported by the container/SLURM env.
+# For local runs (no container), make this robust by auto-detecting the repo root.
+_repo_path = os.environ.get("REPO_PATH")
+if not _repo_path:
+    # This file lives at: <REPO>/evaluation/tau2-bench/tau2/utils/utils.py
+    # parents[4] -> <REPO>
+    _repo_path = str(Path(__file__).resolve().parents[4])
+    os.environ["REPO_PATH"] = _repo_path
+
+# In the original container setup, data was in evaluation/data_dir.
+# For local runs without that structure, use data/ instead (where the repo actually stores it).
+# Allow TAU2_DATA_DIR env var to override if user wants a custom location.
+_data_dir_override = os.environ.get("TAU2_DATA_DIR")
+if _data_dir_override:
+    data_dir = _data_dir_override
+else:
+    _container_data_dir = os.path.join(_repo_path, "evaluation/data_dir")
+    if os.path.isdir(_container_data_dir):
+        data_dir = _container_data_dir
+    else:
+        # Fallback to the actual data/ directory in the repo
+        data_dir = os.path.join(_repo_path, "data")
+
 DATA_DIR = Path(data_dir)
 
 def get_dict_hash(obj: dict) -> str:

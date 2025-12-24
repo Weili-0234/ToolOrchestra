@@ -7,6 +7,7 @@ from tau2.data_model.tasks import Task
 from tau2.domains.movie.data_model import MovieTheaterDB
 from tau2.domains.movie.tools import MovieTheaterTools
 from tau2.environment.environment import Environment
+from tau2.utils import DATA_DIR
 
 
 def get_environment(
@@ -16,9 +17,9 @@ def get_environment(
     if solo_mode:
         raise ValueError("Movie domain does not support solo mode")
     if db is None:
-        db = MovieTheaterDB.load('../data_dir/tau2/domains/movie/db.json')
+        db = MovieTheaterDB.load(str(DATA_DIR / "tau2" / "domains" / "movie" / "db.json"))
     tools = MovieTheaterTools(db)
-    with open('../data_dir/tau2/domains/movie/policy.md', "r") as fp:
+    with open(str(DATA_DIR / "tau2" / "domains" / "movie" / "policy.md"), "r") as fp:
         policy = fp.read()
     return Environment(
         domain_name="movie",

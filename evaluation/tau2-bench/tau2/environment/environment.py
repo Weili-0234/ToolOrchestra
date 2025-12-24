@@ -1,4 +1,5 @@
 import json
+import time
 from copy import deepcopy
 from datetime import date, datetime
 from typing import Any, Literal, Optional
@@ -6,6 +7,10 @@ from typing import Any, Literal, Optional
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from tau2.utils.logging_config import (
+    log_profile_event,
+    Timer,
+)
 from tau2.data_model.message import (
     AssistantMessage,
     Message,
@@ -400,6 +405,9 @@ class Environment:
             The response of the tool call.
         """
         error = False
+        tool_timer = Timer()
+        tool_timer.__enter__()
+        
         try:
             resp = self.make_tool_call(
                 message.name, requestor=message.requestor, **message.arguments
@@ -408,6 +416,18 @@ class Environment:
         except Exception as e:
             resp = f"Error: {e}"
             error = True
+        
+        tool_timer.__exit__(None, None, None)
+        
+        # Log tool call with PROFILE level
+        log_profile_event(
+            "tool_call",
+            function=message.name,
+            call_type="local_function",
+            duration_ms=tool_timer.duration_ms,
+            error=error if error else None,
+        )
+        
         logger.debug(f"Response: {resp}")
         resp = self.to_json_str(resp)
         return ToolMessage(

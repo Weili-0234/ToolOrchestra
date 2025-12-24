@@ -7,6 +7,14 @@ from typing import Any, Optional
 import os
 from loguru import logger
 
+from tau2.utils.logging_config import (
+    get_tau2_logger,
+    set_step_context,
+    log_profile_event,
+    log_debug_event,
+    Timer,
+)
+
 from tau2.agent.base import BaseAgent, is_valid_agent_history_message
 from tau2.agent.llm_agent import LLMSoloAgent
 from tau2.data_model.message import (
@@ -87,6 +95,9 @@ class Orchestrator:
         - Initialize the agent and user states.
         - Send the first message (default message from the agent to the user).
         """
+        tau2_logger = get_tau2_logger()
+        tau2_logger.debug(f"Initializing orchestrator for task={self.task.id} domain={self.domain}")
+        
         initial_state = self.task.initial_state
         # 85 initial_state None
         initialization_data = (
@@ -108,6 +119,7 @@ class Orchestrator:
         # message_history []
 
         if self.solo_mode:
+            tau2_logger.debug(f"Running in solo mode for task={self.task.id}")
             assert self.environment.solo_mode, "Environment should be in solo mode"
             assert isinstance(self.agent, LLMSoloAgent), (
                 "Agent must be a LLMSoloAgent in solo mode"
@@ -120,18 +132,22 @@ class Orchestrator:
         # 114 initialization_data None
         # 115 initialization_actions None
         # 116 message_history []
+        tau2_logger.debug(f"Initializing environment for task={self.task.id}")
         self._initialize_environment(
             initialization_data=initialization_data,
             initialization_actions=initialization_actions,
             message_history=message_history,
         )
+        tau2_logger.debug(f"Environment initialized for task={self.task.id}")
 
         # Set seeds for the agent, user
         if self.seed is not None:
+            tau2_logger.debug(f"Setting seed={self.seed} for agent and user in task={self.task.id}")
             self.agent.set_seed(self.seed)
             self.user.set_seed(self.seed)
 
         # Initialize the agent and user states
+        tau2_logger.debug(f"Initializing agent and user states for task={self.task.id}")
         if len(message_history) > 0:
             self.validate_message_history(message_history)
 
@@ -262,9 +278,14 @@ class Orchestrator:
         Returns:
             SimulationRun: The simulation run.
         """
+        tau2_logger = get_tau2_logger()
         start_time = get_now()
         start = time.perf_counter()
+        tau2_logger.debug(f"Starting simulation run for task={self.task.id}")
         self.initialize()
+        tau2_logger.debug(
+            f"Simulation initialized for task={self.task.id} from={self.from_role} to={self.to_role} done={self.done}"
+        )
         while not self.done:
             # with open(os.path.join(self.cur_transfer_dir,f"tau_loop_{self.step_count}"),'w') as f:
             #     f.write(f"263, tau self.step_count, {self.step_count}")
@@ -309,6 +330,15 @@ class Orchestrator:
         # print(299,'step')
         if self.done:
             raise ValueError("Simulation is done")
+        
+        tau2_logger = get_tau2_logger()
+        set_step_context(self.step_count)
+        step_timer = Timer()
+        step_timer.__enter__()
+        
+        tau2_logger.debug(
+            f"Step {self.step_count} starting: from={self.from_role} to={self.to_role} task={self.task.id}"
+        )
         logger.debug(
             f"Step {self.step_count}. Sending message from {self.from_role} to {self.to_role}"
         )
@@ -317,6 +347,9 @@ class Orchestrator:
         )
         # AGENT/ENV -> USER
         if self.from_role in [Role.AGENT, Role.ENV] and self.to_role == Role.USER:
+            tau2_logger.debug(
+                f"Calling user.generate_next_message step={self.step_count} task={self.task.id}"
+            )
             user_msg, self.user_state = self.user.generate_next_message(
                 self.message, self.user_state
             )
@@ -336,6 +369,9 @@ class Orchestrator:
         elif (
             self.from_role == Role.USER or self.from_role == Role.ENV
         ) and self.to_role == Role.AGENT:
+            tau2_logger.debug(
+                f"Calling agent.generate_next_message step={self.step_count} task={self.task.id}"
+            )
             agent_msg, self.agent_state = self.agent.generate_next_message(
                 self.message, self.agent_state
             )
@@ -382,6 +418,15 @@ class Orchestrator:
             )
         self.step_count += 1
         self.environment.sync_tools()
+        
+        # Log step completion with timing
+        step_timer.__exit__(None, None, None)
+        log_profile_event(
+            "step_complete",
+            total_duration_ms=step_timer.duration_ms,
+            from_role=str(self.from_role.value) if hasattr(self.from_role, 'value') else str(self.from_role),
+            to_role=str(self.to_role.value) if hasattr(self.to_role, 'value') else str(self.to_role),
+        )
 
     def get_trajectory(self) -> list[Message]:
         """

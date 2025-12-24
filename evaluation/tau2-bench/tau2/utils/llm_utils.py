@@ -12,6 +12,13 @@ from litellm.caching.caching import Cache
 from litellm.main import ModelResponse, Usage
 from loguru import logger
 from transformers import AutoTokenizer
+from tau2.utils.logging_config import (
+    get_tau2_logger,
+    log_profile_event,
+    log_user_judge_event,
+    PROFILE,
+    Timer,
+)
 from tau2.config import (
     DEFAULT_LLM_CACHE_TYPE,
     DEFAULT_MAX_RETRIES,
@@ -417,6 +424,19 @@ def generate(
     """
     if role!='user' and role!='assistant' and role!='evaluator':
         raise ValueError(f'unknown role {role}')
+    
+    tau2_logger = get_tau2_logger()
+    llm_timer = Timer()
+    llm_timer.__enter__()
+    # Main ToolOrchestra (local vLLM 8B) inference wall time, recorded separately from total duration.
+    toolorchestra_vllm_infer_ms: Optional[float] = None
+    toolorchestra_vllm_prefill_ms: Optional[float] = None
+    toolorchestra_vllm_decode_ms: Optional[float] = None
+    toolorchestra_vllm_prefill_len: Optional[int] = None
+    toolorchestra_vllm_decode_len: Optional[int] = None
+    
+    tau2_logger.debug(f"LLM generate: role={role} model={model} num_messages={len(messages)} use_model_tool={use_model_tool}")
+    
     if kwargs.get("num_retries") is None:
         kwargs["num_retries"] = DEFAULT_MAX_RETRIES
 
@@ -431,11 +451,24 @@ def generate(
     original_tools = copy.deepcopy(tools)
     start_time = time.time()
     cost = 0
+    
+    # Determine call type for logging
+    call_type = "unknown"
+    if 'qwen' in model.lower() or 'huggingface' in model.lower() or 'llama' in model.lower() or 'nemotron' in model.lower() or 'orchestrator' in model.lower():
+        call_type = "vllm"
+    elif 'claude' in model.lower():
+        call_type = "claude"
+    elif model in ['o3','o3-mini','gpt-4o','o3-high','gpt-5','gpt-5-mini','gpt-4.1','gpt-4o-mini']:
+        call_type = "openai"
+    else:
+        call_type = "openai"  # default to openai for other models
     if role=='assistant' and ('qwen' in model.lower() or 'huggingface' in model.lower() or 'llama' in model.lower() or 'nemotron' in model.lower() or 'orchestrator' in model.lower()):
-        if not 'nemotron' in model.lower():
-            with open(model_config_path) as f:
-                model_config = json.load(f)[model]
-            config_idx = random.randint(0, len(model_config)-1)
+        # Local model path: always route through local vLLM using model_config_path.
+        # Previously, 'nemotron' models were hard-coded to 'nv/dev' (Together API),
+        # which makes local runs hang/idly wait and never hit vLLM.
+        with open(model_config_path) as f:
+            model_config = json.load(f)[model]
+        config_idx = random.randint(0, len(model_config)-1)
         if use_model_tool:
             updated_tools = []
             for t in tools:
@@ -446,10 +479,51 @@ def generate(
             updated_tools = tools
         tools_length = len(tokenizer(str(updated_tools))['input_ids'])
         updated_messages = cut_middle_turns(tokenizer=tokenizer,messages=litellm_messages,max_length=23000-tools_length)
-        if 'nemotron' in model.lower():
-            response = get_llm_response(model=model,messages=updated_messages,tools=updated_tools,return_raw_response=True,temperature=1,model_type='nv/dev',max_length=8000)
+        # Time only the main ToolOrchestra vLLM model inference (Nemotron-Orchestrator-8B).
+        # If log-level is PROFILE/DEBUG, enable streaming profiling to capture TTFT (prefill) + decode time.
+        is_toolorchestra_main_vllm = ("orchestrator" in model.lower() and "8b" in model.lower())
+        stream_profile = bool(is_toolorchestra_main_vllm and tau2_logger.isEnabledFor(PROFILE))
+        if is_toolorchestra_main_vllm:
+            _infer_timer = Timer()
+            _infer_timer.__enter__()
+            try:
+                response = get_llm_response(
+                    model=model,
+                    messages=updated_messages,
+                    tools=updated_tools,
+                    return_raw_response=True,
+                    temperature=1,
+                    model_config=model_config,
+                    model_config_path=model_config_path,
+                    model_config_idx=config_idx,
+                    model_type='vllm',
+                    max_length=8000,
+                    tau2_stream_profile=stream_profile,
+                )
+            finally:
+                _infer_timer.__exit__(None, None, None)
+            # Default: python-side wall time; if streaming profiling is enabled, prefer request-derived timings.
+            toolorchestra_vllm_infer_ms = _infer_timer.duration_ms
+            if not isinstance(response, str):
+                toolorchestra_vllm_infer_ms = getattr(response, "tau2_vllm_infer_ms", toolorchestra_vllm_infer_ms)
+                toolorchestra_vllm_prefill_ms = getattr(response, "tau2_vllm_prefill_ms", None)
+                toolorchestra_vllm_decode_ms = getattr(response, "tau2_vllm_decode_ms", None)
+                # Lengths: prompt/completion tokens
+                toolorchestra_vllm_prefill_len = getattr(response, "tau2_vllm_prompt_tokens", None)
+                toolorchestra_vllm_decode_len = getattr(response, "tau2_vllm_completion_tokens", None)
         else:
-            response = get_llm_response(model=model,messages=updated_messages,tools=updated_tools,return_raw_response=True,temperature=1,model_config=model_config,model_config_path=model_config_path,model_config_idx=config_idx,model_type='vllm',max_length=8000)
+            response = get_llm_response(
+                model=model,
+                messages=updated_messages,
+                tools=updated_tools,
+                return_raw_response=True,
+                temperature=1,
+                model_config=model_config,
+                model_config_path=model_config_path,
+                model_config_idx=config_idx,
+                model_type='vllm',
+                max_length=8000,
+            )
         mode_to_call = None
         tool_calls = []
         input_tokens = 0
@@ -493,7 +567,12 @@ def generate(
                     })
         expert_model = mode_to_call
         if mode_to_call:
+            # Time the expert call separately
+            expert_timer = Timer()
+            expert_timer.__enter__()
+            
             llm_messages = to_litellm_messages(messages,model=mode_to_call,use_model_tool=False,domain=domain,role=role)
+            expert_call_type = "openai" if 'gpt-5' in mode_to_call else "vllm"
             if 'gpt-5' in mode_to_call:
                 response = get_llm_response(model=mode_to_call,messages=llm_messages,tools=original_tools,return_raw_response=True,max_length=40000)
             elif 'qwen3' in mode_to_call.lower():
@@ -504,6 +583,17 @@ def generate(
                 response = get_llm_response(model=mode_to_call,messages=cut_messages,tools=original_tools,return_raw_response=True,model_config=model_config,model_config_path=model_config_path,model_config_idx=config_idx,model_type='vllm',max_length=8000)
             else:
                 raise ValueError(f'Model {mode_to_call} is not supported')
+            
+            expert_timer.__exit__(None, None, None)
+            
+            # Log expert call
+            log_profile_event(
+                "expert_call",
+                model=mode_to_call,
+                call_type=expert_call_type,
+                duration_ms=expert_timer.duration_ms,
+            )
+            
             if isinstance(response,str):
                 response_content = "Wait a minute, I will take it very soon"
             else:
@@ -551,6 +641,14 @@ def generate(
             'tool_calls': tool_calls,
         }
     else:
+        try:
+            if os.getenv("TAU2_TRACE", "0") == "1":
+                print(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] llm_utils.generate: calling get_llm_response role={role} model={model}",
+                    flush=True,
+                )
+        except Exception:
+            pass
         response = get_llm_response(model=model,messages=litellm_messages,tools=tools,return_raw_response=True,max_length=40000)
         tool_calls = []
         if not isinstance(response,str) and response.choices[0].message.tool_calls:
@@ -606,6 +704,33 @@ def generate(
         usage=usage,
         raw_data=response,
     )
+    
+    # Log LLM call completion with timing
+    llm_timer.__exit__(None, None, None)
+    
+    # Log based on role
+    if role == 'assistant':
+        log_profile_event(
+            "llm_call",
+            model=model,
+            call_type=call_type,
+            duration_ms=llm_timer.duration_ms,
+            toolorchestra_vllm_infer_ms=toolorchestra_vllm_infer_ms,
+            toolorchestra_vllm_prefill_ms=toolorchestra_vllm_prefill_ms,
+            toolorchestra_vllm_decode_ms=toolorchestra_vllm_decode_ms,
+            toolorchestra_vllm_prefill_len=toolorchestra_vllm_prefill_len,
+            toolorchestra_vllm_decode_len=toolorchestra_vllm_decode_len,
+            has_tool_calls=bool(tool_calls),
+        )
+    elif role in ('user', 'evaluator'):
+        event_type = "user_sim" if role == 'user' else "evaluator"
+        log_user_judge_event(
+            event_type,
+            model=model,
+            call_type=call_type,
+            duration_ms=llm_timer.duration_ms,
+        )
+    
     return message
 
 

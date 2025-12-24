@@ -7,6 +7,7 @@ from tau2.data_model.tasks import Task
 from tau2.domains.railway.data_model import TrainDB
 from tau2.domains.railway.tools import RailwayTools
 from tau2.environment.environment import Environment
+from tau2.utils import DATA_DIR
 
 
 def get_environment(
@@ -16,9 +17,9 @@ def get_environment(
     if solo_mode:
         raise ValueError("Railway domain does not support solo mode")
     if db is None:
-        db = TrainDB.load('../data_dir/tau2/domains/railway/db.json')
+        db = TrainDB.load(str(DATA_DIR / "tau2" / "domains" / "railway" / "db.json"))
     tools = RailwayTools(db)
-    with open('../data_dir/tau2/domains/railway/policy.md', "r") as fp:
+    with open(str(DATA_DIR / "tau2" / "domains" / "railway" / "policy.md"), "r") as fp:
         policy = fp.read()
     return Environment(
         domain_name="railway",

@@ -1,6 +1,17 @@
 import argparse
 import sys
-sys.path.append('evaluation/tau2-bench')
+import os
+from pathlib import Path
+
+# Make `python tau2/cli.py ...` runnable from any working directory.
+# When executed as a script inside the `tau2/` package directory, Python's
+# sys.path[0] points to `<...>/tau2`, which breaks `import tau2.*` unless the
+# parent directory is on sys.path.
+TAU2_BENCH_ROOT = Path(__file__).resolve().parents[1]
+if str(TAU2_BENCH_ROOT) not in sys.path:
+    sys.path.insert(0, str(TAU2_BENCH_ROOT))
+
+from tau2.utils.logging_config import configure_logging
 from tau2.config import (
     DEFAULT_AGENT_IMPLEMENTATION,
     DEFAULT_LLM_AGENT,
@@ -148,13 +159,18 @@ def main():
         "--log-level",
         type=str,
         default=DEFAULT_LOG_LEVEL,
-        help=f"The log level to use for the simulation. Default is {DEFAULT_LOG_LEVEL}.",
+        choices=["DEBUG", "PROFILE", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help=f"The log level to use for the simulation. PROFILE enables tool/LLM call timing. Default is {DEFAULT_LOG_LEVEL}.",
     )
     parser.add_argument(
         "--use_model_tool",
         action='store_true',
     )
     args = parser.parse_args()
+    
+    # Configure logging before running the simulation
+    configure_logging(level=args.log_level, file_handler=os.getenv("TAU2_LOG_FILE") or None)
+    
     run_domain(
             RunConfig(
                 domain=args.domain,
@@ -182,7 +198,6 @@ def main():
             )
         )
     
-    import os
     with open(os.path.join(args.cur_transfer_dir,'done'),'w') as f:
         f.write("Done!")
 

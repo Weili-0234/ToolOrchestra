@@ -23,11 +23,35 @@ import requests
 import subprocess
 from openai import OpenAI
 import random
+from copy import deepcopy
 from typing import List, Tuple, Dict, Any, Optional
+import uuid
+import traceback
+from datetime import datetime
 
 KEYS_DIR = 'keys'
 if not os.path.isdir(KEYS_DIR):
     os.makedirs(KEYS_DIR,exist_ok=True)
+
+def _llm_log_path() -> str:
+    # If unset, we won't write any JSONL logs (avoid surprising file writes).
+    return os.getenv("TOOL_ORCH_LLM_LOG_PATH", "")
+
+def _llm_log(event: dict) -> None:
+    """
+    Best-effort JSONL logging. Never raises.
+    """
+    try:
+        path = _llm_log_path()
+        if not path:
+            return
+        event = dict(event)
+        event.setdefault("ts", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception:
+        # Never break the main flow due to logging
+        pass
 
 def convert_openai_tools_to_claude(openai_tools: list) -> list:
     claude_tools = []
@@ -297,15 +321,47 @@ def get_openai_client(model):
 def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,tools=None,show_messages=False,model_type=None,max_length=1024,model_config=None,model_config_idx=0,model_config_path=None,payload=None,**kwargs):
     if isinstance(messages,str):
         messages = [{'role': 'user','content': messages}]
+    req_id = str(uuid.uuid4())
+    _llm_log({
+        "event": "enter",
+        "req_id": req_id,
+        "model": model,
+        "model_type": model_type,
+        "max_length": max_length,
+        "temperature": temperature,
+        "has_tools": bool(tools),
+        "num_messages": len(messages) if isinstance(messages, list) else None,
+    })
+    # Optional: enable streaming for local vLLM calls so we can measure time-to-first-token (prefill)
+    # and decode time. Only used by tau2 profiling.
+    tau2_stream_profile = bool(kwargs.pop("tau2_stream_profile", False))
     if model in ['o3','o3-mini','gpt-4o','o3-high','gpt-5','gpt-5-mini','gpt-4.1','gpt-4o-mini']:
         if max_length==1024:
             max_length = 40000
         if model in ['gpt-4.1','gpt-4o-mini']:
             max_length = 8000
+        # Safety clamp: prevent infinite retry due to invalid max_tokens.
+        # Observed: gpt-4o rejects >16384 completion tokens.
+        OPENAI_MAX_COMPLETION_TOKENS = {
+            "gpt-4o": 16384,
+            "gpt-4o-mini": 16384,
+            "gpt-4.1": 8000,
+        }
+        # Default to a safe ceiling to avoid invalid_request loops on newer models.
+        max_length = min(max_length, OPENAI_MAX_COMPLETION_TOKENS.get(model, 16384))
         openai_client = get_openai_client(model=model)
         answer = ''
         while answer=='':
             try:
+                print(f"DEBUG: Calling OpenAI model={model} req_id={req_id}", flush=True)
+                _llm_log({
+                    "event": "request",
+                    "req_id": req_id,
+                    "backend": "openai",
+                    "model": model,
+                    "max_length": max_length,
+                })
+                t0 = time.time()
                 chat_completion = openai_client.chat.completions.create(
                     model=model,
                     messages=messages,
@@ -313,12 +369,34 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                     tools=tools,
                     max_completion_tokens=max_length
                 )
+                dur = time.time() - t0
                 if return_raw_response:
                     answer = chat_completion
                 else:
                     answer = chat_completion.choices[0].message.content
+                print(f"DEBUG: OpenAI request successful req_id={req_id}", flush=True)
+                _llm_log({
+                    "event": "response",
+                    "req_id": req_id,
+                    "backend": "openai",
+                    "model": model,
+                    "duration_s": round(dur, 4),
+                })
             except Exception as error:
-                time.sleep(60)
+                print(f"Error calling OpenAI req_id={req_id}: {error}", flush=True)
+                _llm_log({
+                    "event": "error",
+                    "req_id": req_id,
+                    "backend": "openai",
+                    "model": model,
+                    "error": repr(error),
+                    "traceback": traceback.format_exc(),
+                })
+                # If this is a hard invalid-request error (e.g., max_tokens too large),
+                # don't retry forever. Surface it to the caller.
+                if "max_tokens is too large" in str(error) or "invalid_value" in str(error):
+                    raise
+                time.sleep(5)
         return answer
     elif model_type=='nv/dev':
         answer = ''
@@ -359,36 +437,281 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                 time.sleep(60)
         return answer
     elif 'qwen' in model.lower() or model_type=='vllm':
-        answer = ''
-        while answer=='':
-            config_idx = random.choice(range(len(model_config)))
-            ip_addr = model_config[config_idx]["ip_addr"]
-            port = model_config[config_idx]["port"]
-            try:
-                vllm_client = OpenAI(
-                    api_key="EMPTY",
-                    base_url=f"http://{ip_addr}:{port}/v1",
-                )
-                chat_completion = vllm_client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    max_tokens=max_length,
-                    temperature=temperature,
-                    tools=tools
-                )
-                if return_raw_response:
-                    answer = chat_completion
-                else:
-                    answer = chat_completion.choices[0].message.content
-            except Exception as error:
-                print('Error',error)
-                if os.path.isfile(str(model_config_path)):
-                    # print(f"call {model} error, load {model_config_path}")
-                    with open(model_config_path) as f:
-                        update_model_configs = json.load(f)
-                    model_config = update_model_configs[model]
-                time.sleep(60)
-        return answer
+        # Check if we should use Nebius API for Qwen3-32B
+        nebius_api_key = os.getenv("NEBIUS_API_KEY")
+        use_nebius = nebius_api_key and 'qwen3-32b' in model.lower()
+
+        if use_nebius:
+            # Use Nebius API for Qwen3-32B
+            answer = ''
+            while answer=='':
+                try:
+                    nebius_client = OpenAI(
+                        base_url="https://api.tokenfactory.nebius.com/v1/",
+                        api_key=nebius_api_key
+                    )
+                    # Map model name to Nebius model name
+                    nebius_model = "Qwen/Qwen3-32B-fast"
+
+                    chat_completion = nebius_client.chat.completions.create(
+                        model=nebius_model,
+                        messages=messages,
+                        max_tokens=max_length,
+                        temperature=temperature,
+                        tools=tools
+                    )
+                    if return_raw_response:
+                        answer = chat_completion
+                    else:
+                        answer = chat_completion.choices[0].message.content
+                except Exception as error:
+                    print('Error calling Nebius API:',error)
+                    time.sleep(60)
+            return answer
+        else:
+            # Use local vLLM server
+            answer = ''
+            while answer=='':
+                config_idx = random.choice(range(len(model_config)))
+                ip_addr = model_config[config_idx]["ip_addr"]
+                port = model_config[config_idx]["port"]
+                try:
+                    print(f"DEBUG: Calling vLLM at http://{ip_addr}:{port}/v1/chat/completions (model={model}) req_id={req_id}", flush=True)
+                    _llm_log({
+                        "event": "request",
+                        "req_id": req_id,
+                        "backend": "vllm",
+                        "model": model,
+                        "base_url": f"http://{ip_addr}:{port}/v1",
+                        "max_length": max_length,
+                        "stream": bool(tau2_stream_profile),
+                    })
+                    req_start = time.time()
+                    vllm_client = OpenAI(
+                        api_key="EMPTY",
+                        base_url=f"http://{ip_addr}:{port}/v1",
+                        timeout=600.0
+                    )
+                    if tau2_stream_profile:
+                        # Streaming mode: measure TTFT (prefill) and decode time.
+                        first_token_ts = None
+                        content_parts = []
+                        tool_calls_by_index = {}
+                        final_usage = None
+
+                        def _mark_first_token():
+                            nonlocal first_token_ts
+                            if first_token_ts is None:
+                                first_token_ts = time.time()
+
+                        # Ask for usage in the final chunk if supported by the server/client.
+                        try:
+                            stream = vllm_client.chat.completions.create(
+                                model=model,
+                                messages=messages,
+                                max_tokens=max_length,
+                                temperature=temperature,
+                                tools=tools,
+                                stream=True,
+                                stream_options={"include_usage": True},
+                            )
+                        except Exception:
+                            stream = vllm_client.chat.completions.create(
+                                model=model,
+                                messages=messages,
+                                max_tokens=max_length,
+                                temperature=temperature,
+                                tools=tools,
+                                stream=True,
+                            )
+
+                        for chunk in stream:
+                            try:
+                                if getattr(chunk, "usage", None) is not None:
+                                    final_usage = chunk.usage
+                            except Exception:
+                                pass
+
+                            choices = getattr(chunk, "choices", None)
+                            if not choices:
+                                continue
+                            choice0 = choices[0]
+                            delta = getattr(choice0, "delta", None)
+                            if delta is None:
+                                continue
+
+                            delta_content = getattr(delta, "content", None)
+                            if delta_content:
+                                _mark_first_token()
+                                content_parts.append(delta_content)
+
+                            delta_tool_calls = getattr(delta, "tool_calls", None)
+                            if delta_tool_calls:
+                                _mark_first_token()
+                                for tc in delta_tool_calls:
+                                    idx = getattr(tc, "index", None)
+                                    if idx is None:
+                                        # Fallback: append ordering
+                                        idx = len(tool_calls_by_index)
+                                    entry = tool_calls_by_index.setdefault(
+                                        idx,
+                                        {
+                                            "id": None,
+                                            "type": "function",
+                                            "function": {"name": None, "arguments": ""},
+                                        },
+                                    )
+                                    tc_id = getattr(tc, "id", None)
+                                    if tc_id:
+                                        entry["id"] = tc_id
+                                    fn = getattr(tc, "function", None)
+                                    if fn is not None:
+                                        fn_name = getattr(fn, "name", None)
+                                        if fn_name:
+                                            entry["function"]["name"] = fn_name
+                                        fn_args = getattr(fn, "arguments", None)
+                                        if fn_args:
+                                            entry["function"]["arguments"] += fn_args
+
+                        end_ts = time.time()
+                        infer_ms = (end_ts - req_start) * 1000.0
+                        if first_token_ts is None:
+                            prefill_ms = infer_ms
+                        else:
+                            prefill_ms = max(0.0, (first_token_ts - req_start) * 1000.0)
+                        decode_ms = max(0.0, infer_ms - prefill_ms)
+
+                        # Prefer usage if present; otherwise keep as 0 to preserve compatibility.
+                        prompt_tokens = getattr(final_usage, "prompt_tokens", 0) if final_usage is not None else 0
+                        completion_tokens = getattr(final_usage, "completion_tokens", 0) if final_usage is not None else 0
+
+                        class _Fn:
+                            def __init__(self, name, arguments):
+                                self.name = name
+                                self.arguments = arguments
+
+                        class _ToolCall:
+                            def __init__(self, id, function):
+                                self.id = id
+                                self.type = "function"
+                                self.function = function
+
+                        class _Msg:
+                            def __init__(self, content, tool_calls):
+                                self.content = content
+                                self.tool_calls = tool_calls
+
+                        class _Choice:
+                            def __init__(self, message):
+                                self.message = message
+
+                        class _Usage:
+                            def __init__(self, prompt_tokens, completion_tokens):
+                                self.prompt_tokens = int(prompt_tokens or 0)
+                                self.completion_tokens = int(completion_tokens or 0)
+
+                        class _ChatCompletion:
+                            def __init__(self, choices, usage):
+                                self.choices = choices
+                                self.usage = usage
+
+                        tool_calls = []
+                        for idx in sorted(tool_calls_by_index.keys()):
+                            e = tool_calls_by_index[idx]
+                            tc_id = e.get("id") or f"call_{req_id}_{idx}"
+                            fn_name = (e.get("function") or {}).get("name") or ""
+                            fn_args = (e.get("function") or {}).get("arguments") or ""
+                            tool_calls.append(_ToolCall(tc_id, _Fn(fn_name, fn_args)))
+
+                        content = "".join(content_parts)
+                        msg = _Msg(content=content, tool_calls=tool_calls or None)
+                        chat_completion = _ChatCompletion(choices=[_Choice(msg)], usage=_Usage(prompt_tokens, completion_tokens))
+
+                        # Attach timing/length fields for tau2 profiling
+                        chat_completion.tau2_vllm_infer_ms = infer_ms
+                        chat_completion.tau2_vllm_prefill_ms = prefill_ms
+                        chat_completion.tau2_vllm_decode_ms = decode_ms
+                        chat_completion.tau2_vllm_prompt_tokens = int(prompt_tokens or 0)
+                        chat_completion.tau2_vllm_completion_tokens = int(completion_tokens or 0)
+
+                        print(
+                            f"DEBUG: vLLM stream complete (took {infer_ms/1000.0:.2f}s, ttft {prefill_ms/1000.0:.2f}s) req_id={req_id}",
+                            flush=True,
+                        )
+                        _llm_log({
+                            "event": "response",
+                            "req_id": req_id,
+                            "backend": "vllm",
+                            "model": model,
+                            "base_url": f"http://{ip_addr}:{port}/v1",
+                            "duration_s": round(infer_ms / 1000.0, 4),
+                            "prefill_s": round(prefill_ms / 1000.0, 4),
+                            "decode_s": round(decode_ms / 1000.0, 4),
+                            "prompt_tokens": int(prompt_tokens or 0),
+                            "completion_tokens": int(completion_tokens or 0),
+                        })
+
+                        if return_raw_response:
+                            answer = chat_completion
+                        else:
+                            # Avoid infinite retry loops if the model responds with tool_calls but empty content.
+                            if content:
+                                answer = content
+                            else:
+                                answer = json.dumps(
+                                    [
+                                        {
+                                            "id": tc.id,
+                                            "name": tc.function.name,
+                                            "arguments": tc.function.arguments,
+                                        }
+                                        for tc in (tool_calls or [])
+                                    ],
+                                    ensure_ascii=False,
+                                )
+                    else:
+                        chat_completion = vllm_client.chat.completions.create(
+                            model=model,
+                            messages=messages,
+                            max_tokens=max_length,
+                            temperature=temperature,
+                            tools=tools
+                        )
+                        req_dur = time.time() - req_start
+                        print(f"DEBUG: vLLM request successful (took {req_dur:.2f}s) req_id={req_id}", flush=True)
+                        _llm_log({
+                            "event": "response",
+                            "req_id": req_id,
+                            "backend": "vllm",
+                            "model": model,
+                            "base_url": f"http://{ip_addr}:{port}/v1",
+                            "duration_s": round(req_dur, 4),
+                        })
+                        
+                        if return_raw_response:
+                            answer = chat_completion
+                        else:
+                            answer = chat_completion.choices[0].message.content
+                except Exception as error:
+                    print(f'Error calling vLLM: {error}', flush=True)
+                    traceback.print_exc()
+                    _llm_log({
+                        "event": "error",
+                        "req_id": req_id,
+                        "backend": "vllm",
+                        "model": model,
+                        "base_url": f"http://{ip_addr}:{port}/v1",
+                        "error": repr(error),
+                        "traceback": traceback.format_exc(),
+                    })
+                    if os.path.isfile(str(model_config_path)):
+                        # print(f"call {model} error, load {model_config_path}")
+                        with open(model_config_path) as f:
+                            update_model_configs = json.load(f)
+                        model_config = update_model_configs[model]
+                    print("Retrying in 5 seconds...", flush=True)
+                    time.sleep(5)
+            return answer
     elif 'claude' in model.lower():
         access_token = get_claude_token()
         if 'opus' in model:
@@ -433,13 +756,16 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
         answer = ''
         while answer=='':
             try:
+                print(f"DEBUG: Calling Claude model={model}", flush=True)
                 response = requests.post(endpoint, headers=headers, json=payload)
                 response.raise_for_status()
                 if return_raw_response:
                     answer = response.json()
                 else:
                     answer = response.json()['content'][0]['text']
+                print(f"DEBUG: Claude request successful", flush=True)
             except Exception as error:
-                time.sleep(60)
+                print(f"Error calling Claude: {error}", flush=True)
+                time.sleep(5)
         return answer
 

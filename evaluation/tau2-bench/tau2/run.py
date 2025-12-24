@@ -1,12 +1,18 @@
 import json
 import multiprocessing
 import random
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 import os
 from loguru import logger
 import time
+from tau2.utils.logging_config import (
+    configure_logging,
+    set_task_context,
+    clear_task_context,
+    get_tau2_logger,
+)
 from tau2.agent.llm_agent import LLMAgent, LLMGTAgent, LLMSoloAgent
 from tau2.data_model.simulation import (
     AgentInfo,
@@ -52,8 +58,21 @@ def load_tasks(task_set_name: str, task_path: str, save_to) -> list[Task]:
     """
     global registry
     task_loader = registry.get_tasks_loader(task_set_name)
-    tasks = task_loader(task_path=task_path,save_to=save_to)
-    return tasks
+    # Domain task loaders are not consistent across domains:
+    # - Some accept (task_path, save_to) (e.g., retail/telecom/airline)
+    # - Some accept no args and use built-in paths (e.g., mock)
+    # For local runs we pass an explicit `task_path`; fall back to generic JSON loading if needed.
+    if task_path:
+        try:
+            return task_loader(task_path=task_path, save_to=save_to)
+        except TypeError:
+            try:
+                return task_loader(task_path, save_to)
+            except TypeError:
+                with open(task_path, "r") as fp:
+                    tasks = json.load(fp)
+                return [Task.model_validate(task) for task in tasks]
+    return task_loader()
 
 
 def get_tasks(
@@ -66,10 +85,15 @@ def get_tasks(
     """
     Loads the tasks for the given domain.
     """
+    # If no explicit task IDs are provided, load the full task list for the domain
+    # and (optionally) restrict to the first `num_tasks` for quick eval/debug.
     if task_ids is None:
-        return load_tasks(task_set_name=task_set_name,task_path=task_path,save_to=save_to)
+        tasks = load_tasks(task_set_name=task_set_name, task_path=task_path, save_to=save_to)
+        if num_tasks is not None:
+            tasks = tasks[:num_tasks]
+        return tasks
     tasks = [
-        task for task in load_tasks(task_set_name=task_set_name,task_path=task_path) if task.id in task_ids
+        task for task in load_tasks(task_set_name=task_set_name, task_path=task_path, save_to=save_to) if task.id in task_ids
     ]
     if len(tasks) != len(task_ids):
         missing_tasks = set(task_ids) - set([task.id for task in tasks])
@@ -209,9 +233,20 @@ def run_tasks(
     save_dir = save_dir[:-len('.json')]
     # updated_tasks = []
 
-    # Set log level from config
+    # Configure tau2 logging with the specified level.
+    # If TAU2_LOG_FILE is set (e.g., by run_local.py), also append structured logs to that file.
+    configure_logging(level=log_level, file_handler=os.getenv("TAU2_LOG_FILE") or None)
+    tau2_logger = get_tau2_logger()
+    
+    # Set log level for loguru logger as well
     logger.remove()
-    logger.add(lambda msg: print(msg), level=log_level)
+    # Loguru does not know about our custom PROFILE/USER_JUDGE names.
+    # Map them to a valid loguru level to avoid crashing when --log-level PROFILE is used.
+    loguru_level = log_level
+    if isinstance(log_level, str) and log_level.upper() in ("PROFILE", "USER_JUDGE"):
+        loguru_level = "INFO"
+    logger.add(lambda msg: print(msg), level=loguru_level)
+    
     if len(tasks) == 0:
         raise ValueError("No tasks to run")
     if num_trials <= 0:
@@ -274,62 +309,107 @@ def run_tasks(
             
 
     def _run(task: Task, trial: int, seed: int, progress_str: str) -> SimulationRun:
-        # ConsoleDisplay.console.print(
-        #     f"[bold green]{progress_str} Running task {task.id}, trial {trial + 1}[/bold green]"
-        # )
-        # try:
-        start_time = time.time()
-        simulation = run_task(
-            domain=domain,
-            task=task,
-            agent=agent,
-            user=user,
-            llm_agent=llm_agent,
-            llm_args_agent=llm_args_agent,
-            llm_user=llm_user,
-            llm_args_user=llm_args_user,
-            max_steps=max_steps,
-            max_errors=max_errors,
-            evaluation_type=evaluation_type,
-            seed=seed,
-            cur_transfer_dir=cur_transfer_dir,
-            model_config_path=model_config_path,
-            use_model_tool=use_model_tool
+        # Set task context for logging in this thread
+        set_task_context(task.id, domain)
+        
+        try:
+            start_time = time.time()
+            simulation = run_task(
+                domain=domain,
+                task=task,
+                agent=agent,
+                user=user,
+                llm_agent=llm_agent,
+                llm_args_agent=llm_args_agent,
+                llm_user=llm_user,
+                llm_args_user=llm_args_user,
+                max_steps=max_steps,
+                max_errors=max_errors,
+                evaluation_type=evaluation_type,
+                seed=seed,
+                cur_transfer_dir=cur_transfer_dir,
+                model_config_path=model_config_path,
+                use_model_tool=use_model_tool
+            )
+            latency = time.time()-start_time
+            simulation.trial = trial
+            _save(simulation,latency=latency)
+            return simulation
+        finally:
+            # Clear task context when done
+            clear_task_context()
+
+    def _emit_task_complete_marker(
+        *,
+        domain: str,
+        trial: int,
+        task_id: str,
+        status: str,
+        completed_domain: int,
+        total_domain: int,
+    ) -> None:
+        # Machine-parsable marker for run_local.py to compute overall ETA.
+        print(
+            "[TAU2_TASK_COMPLETE] "
+            f"domain={domain} trial={trial} task_id={task_id} status={status} "
+            f"completed_domain={completed_domain} total_domain={total_domain}",
+            flush=True,
         )
-        # print(310,'before save')
-        latency = time.time()-start_time
-        simulation.trial = trial
-        _save(simulation,latency=latency)
-        # except Exception as e:
-        #     print(f"Tau run error: {e}")
-        #     with open(os.path.join(save_dir,f'{task.id}.json'),'w') as f:
-        #         json.dump({
-        #             'task_id': task.id,
-        #             'tau_run_error': f"Tau run error: {e}"
-        #         },f,indent=2)
-        #     simulation = None
-        return simulation
 
     args = []
+    total_domain = len(tasks) * num_trials
+    completed_domain = 0
     for trial in range(num_trials):
+        print(f"Starting trial {trial+1}/{num_trials}", flush=True)
         for i, task in enumerate(tasks):
+            print(f"Processing task {i+1}/{len(tasks)}: {task.id} (trial {trial+1})", flush=True)
             if (trial, task.id, seeds[trial]) in done_runs:
                 ConsoleDisplay.console.print(
                     f"[bold yellow]Skipping task {task.id}, trial {trial} because it has already been run.[/bold yellow]"
+                )
+                completed_domain += 1
+                _emit_task_complete_marker(
+                    domain=domain,
+                    trial=trial,
+                    task_id=task.id,
+                    status="skipped",
+                    completed_domain=completed_domain,
+                    total_domain=total_domain,
                 )
                 continue
             progress_str = f"{i}/{len(tasks)} (trial {trial + 1}/{num_trials})"
             args.append((task, trial, seeds[trial], progress_str))
 
-    # res = list(map(_run, *zip(*args)))
-    # if res:
-    #     simulation_results.simulations.extend(res)
-    # print(309,'len(simulation_results.simulations)', len(simulation_results.simulations))
+    tau2_logger.info(
+        f"Starting evaluation: scheduled={len(args)} total_domain={total_domain} "
+        f"max_concurrency={max_concurrency}"
+    )
+
     with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
-        res = list(executor.map(_run, *zip(*args)))
-        if res:
-            simulation_results.simulations.extend(res)
-        print(len(simulation_results.simulations))
+        futures = {executor.submit(_run, *arg): arg for arg in args}
+
+        for future in as_completed(futures):
+            task, trial, _seed, _progress_str = futures[future]
+            status = "ok"
+            try:
+                result = future.result()
+                if result:
+                    simulation_results.simulations.append(result)
+            except Exception as e:
+                status = "error"
+                tau2_logger.warning(f"Task failed with error: {e}")
+            finally:
+                completed_domain += 1
+                _emit_task_complete_marker(
+                    domain=domain,
+                    trial=trial,
+                    task_id=task.id,
+                    status=status,
+                    completed_domain=completed_domain,
+                    total_domain=total_domain,
+                )
+    
+    tau2_logger.info(f"Completed {len(simulation_results.simulations)} simulations")
     # ConsoleDisplay.console.print(
     #     "\n✨ [bold green]Successfully completed all simulations![/bold green]\n"
     #     "To review the simulations, run: [bold blue]tau2 view[/bold blue]"

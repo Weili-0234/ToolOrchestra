@@ -149,7 +149,11 @@ class UserSimulator(BaseUser):
         else:
             state.messages.append(message)
         messages = state.system_messages + state.flip_roles()
-        # print(156,messages)
+        if os.getenv("TAU2_TRACE", "0") == "1":
+            print(
+                f"[{__import__('time').strftime('%Y-%m-%d %H:%M:%S')}] user_simulator: generate_next_message llm={self.llm}",
+                flush=True,
+            )
 
         # Generate response
         assistant_message = generate(
@@ -159,6 +163,11 @@ class UserSimulator(BaseUser):
             role='user',
             **self.llm_args,
         )
+        if os.getenv("TAU2_TRACE", "0") == "1":
+            print(
+                f"[{__import__('time').strftime('%Y-%m-%d %H:%M:%S')}] user_simulator: got assistant_message (len={len(assistant_message.content or '')})",
+                flush=True,
+            )
 
         user_response = assistant_message.content
         logger.debug(f"Response: {user_response}")

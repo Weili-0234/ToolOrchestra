@@ -7,6 +7,7 @@ from tau2.data_model.tasks import Task
 from tau2.domains.travel.data_model import TravelAgencyDB
 from tau2.domains.travel.tools import TravelAgencyTools
 from tau2.environment.environment import Environment
+from tau2.utils import DATA_DIR
 
 
 def get_environment(
@@ -16,9 +17,9 @@ def get_environment(
     if solo_mode:
         raise ValueError("Travel domain does not support solo mode")
     if db is None:
-        db = TravelAgencyDB.load('../data_dir/tau2/domains/travel/db.json')
+        db = TravelAgencyDB.load(str(DATA_DIR / "tau2" / "domains" / "travel" / "db.json"))
     tools = TravelAgencyTools(db)
-    with open('../data_dir/tau2/domains/travel/policy.md', "r") as fp:
+    with open(str(DATA_DIR / "tau2" / "domains" / "travel" / "policy.md"), "r") as fp:
         policy = fp.read()
     return Environment(
         domain_name="travel",

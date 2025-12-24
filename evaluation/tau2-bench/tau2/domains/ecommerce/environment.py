@@ -7,6 +7,7 @@ from tau2.data_model.tasks import Task
 from tau2.domains.ecommerce.data_model import ECommerceDB
 from tau2.domains.ecommerce.tools import ECommerceTools
 from tau2.environment.environment import Environment
+from tau2.utils import DATA_DIR
 
 
 def get_environment(
@@ -16,9 +17,9 @@ def get_environment(
     if solo_mode:
         raise ValueError("E-commerce domain does not support solo mode")
     if db is None:
-        db = ECommerceDB.load('../data_dir/tau2/domains/ecommerce/db.json')
+        db = ECommerceDB.load(str(DATA_DIR / 'tau2' / 'domains' / 'ecommerce' / 'db.json'))
     tools = ECommerceTools(db)
-    with open('../data_dir/tau2/domains/ecommerce/policy.md', "r") as fp:
+    with open(str(DATA_DIR / 'tau2' / 'domains' / 'ecommerce' / 'policy.md'), "r") as fp:
         policy = fp.read()
     return Environment(
         domain_name="ecommerce",

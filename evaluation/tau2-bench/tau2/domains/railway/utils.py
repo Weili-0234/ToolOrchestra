@@ -1,6 +1,7 @@
 from tau2.utils.utils import DATA_DIR
 
-AIRLINE_DATA_DIR = DATA_DIR / "tau2" / "domains" / "airline"
-AIRLINE_DB_PATH = AIRLINE_DATA_DIR / "db.json"
-AIRLINE_POLICY_PATH = AIRLINE_DATA_DIR / "policy.md"
-AIRLINE_TASK_SET_PATH = AIRLINE_DATA_DIR / "tasks_train.json"
+RAILWAY_DATA_DIR = DATA_DIR / "tau2" / "domains" / "railway"
+RAILWAY_DB_PATH = RAILWAY_DATA_DIR / "db.json"
+RAILWAY_POLICY_PATH = RAILWAY_DATA_DIR / "policy.md"
+# Not all repo variants ship a tasks file for this domain; tasks are typically provided via CLI.
+RAILWAY_TASK_SET_PATH = RAILWAY_DATA_DIR / "tasks.json"
