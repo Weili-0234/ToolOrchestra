@@ -1,0 +1,79 @@
+# Retriever 环境配置方案（Blackwell RTX 5090）
+
+## ✅ 验证通过的配置
+
+### 环境信息
+- **GPU**: NVIDIA GeForce RTX 5090 (Blackwell sm_120)
+- **Python**: 3.12
+- **CUDA**: 12.8
+- **PyTorch**: 2.7.1 (正式版，非 Nightly)
+
+### 完整安装步骤
+
+```bash
+# 1. 创建环境
+conda create -n retriever python=3.12 -y
+conda activate retriever
+
+# 2. 安装 PyTorch 2.7.1 + CUDA 12.8 (支持 Blackwell)
+pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# 3. 安装 Faiss-GPU (通过 Conda)
+conda install -y -c pytorch -c nvidia faiss-gpu
+
+# 4. 安装 Flash Attention 2 (预编译轮子)
+pip install packaging ninja psutil
+pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+
+# 5. 安装其他依赖
+pip install transformers datasets pyserini uvicorn fastapi tavily-python
+```
+
+## 🧪 验证结果
+
+### PyTorch + CUDA
+✅ CUDA 可用，张量运算正常
+
+### Faiss-GPU
+✅ GPU 索引创建和搜索正常
+- 测试数据：100,000 个 64 维向量
+- 查询：10,000 次 k=4 最近邻搜索
+
+### Flash Attention
+✅ 前向传播和反向传播正常
+- 批大小：2
+- 序列长度：128
+- 注意力头数：4
+- 头维度：64
+
+### 其他依赖
+✅ transformers, datasets, pyserini, uvicorn, fastapi, tavily 全部导入成功
+
+## 📋 关键软件包版本
+
+```
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+torchaudio==2.7.1+cu128
+flash-attn==2.8.3
+faiss-gpu==1.12.0
+triton==3.3.1
+```
+
+## 💡 关键要点
+
+1. **PyTorch 2.7.1** 是首个正式支持 Blackwell (sm_120) 的版本，无需使用 Nightly 版本
+2. **CUDA 12.8** 是 Blackwell 架构所需的最低 CUDA 版本
+3. **Faiss-GPU** 通过 Conda 安装可与 pip 安装的 PyTorch 共存
+4. **Flash Attention** 需要使用与 PyTorch 2.7 匹配的预编译轮子，从源码编译会遇到文件系统链接错误
+5. 该配置与同机器上的 vllm1 环境保持一致（PyTorch 2.7.1 + CUDA 12.8）
+
+## 📝 测试脚本
+
+测试脚本已保存在 `/workspace/test_env.py`，可随时运行验证环境：
+
+```bash
+python test_env.py
+```
+
