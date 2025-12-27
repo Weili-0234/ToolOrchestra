@@ -85,6 +85,7 @@ Thumbs.db
 *.temp
 *.cache
 .cache/
+evaluation/cache/*
 
 # Coverage and testing
 .coverage
@@ -98,3 +99,5 @@ htmlcov/
 
 # Slurm job files
 slurm-*.out
+
+*.arrow

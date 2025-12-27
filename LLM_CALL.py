@@ -335,6 +335,58 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
     # Optional: enable streaming for local vLLM calls so we can measure time-to-first-token (prefill)
     # and decode time. Only used by tau2 profiling.
     tau2_stream_profile = bool(kwargs.pop("tau2_stream_profile", False))
+    # Together AI (OpenAI-compatible) hosted models.
+    #
+    # IMPORTANT:
+    # - For Together **dedicated endpoints**, the correct `model` is typically the endpoint **Name**
+    #   (e.g. "HK123/Qwen2.5-Math-72B-Instruct-1d5fc83c"), not the endpoint ID ("endpoint-...").
+    # - We keep "endpoint-..." support as a legacy/back-compat path because some workspaces/scripts
+    #   still reference endpoint IDs.
+    if isinstance(model, str) and model.startswith("endpoint-"):
+        answer = ''
+        # Defensive copy; also strip any tool_calls fields that Together may not accept in messages.
+        updated_messages = []
+        for m in messages:
+            if isinstance(m, dict) and 'tool_calls' in m:
+                m = dict(m)
+                m['content'] = (m.get('content') or '') + str(m.get('tool_calls'))
+                m.pop('tool_calls', None)
+            updated_messages.append(m)
+        while answer == '':
+            try:
+                oss_client = OpenAI(
+                    base_url="https://api.together.xyz/v1",
+                    api_key=os.getenv("TOGETHER_API_KEY"),
+                )
+                if tools:
+                    chat_completion = oss_client.chat.completions.create(
+                        model=model,
+                        messages=updated_messages,
+                        temperature=temperature,
+                        top_p=0.7,
+                        max_tokens=max_length,
+                        tools=tools,
+                    )
+                else:
+                    chat_completion = oss_client.chat.completions.create(
+                        model=model,
+                        messages=updated_messages,
+                        temperature=temperature,
+                        top_p=0.7,
+                        max_tokens=max_length,
+                    )
+                if return_raw_response:
+                    answer = chat_completion
+                else:
+                    answer = chat_completion.choices[0].message.content
+            except Exception as error:
+                print(
+                    f"Error calling Together (legacy endpoint-id model) req_id={req_id}: {error}. "
+                    f"Note: Together often requires the endpoint Name (e.g. 'HK123/...') as `model`.",
+                    flush=True,
+                )
+                time.sleep(60)
+        return answer
     if model in ['o3','o3-mini','gpt-4o','o3-high','gpt-5','gpt-5-mini','gpt-4.1','gpt-4o-mini']:
         if max_length==1024:
             max_length = 40000
@@ -398,7 +450,11 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                     raise
                 time.sleep(5)
         return answer
-    elif model_type=='nv/dev':
+    # Together OpenAI-compatible API (used by local HLE eval for OSS expert calls).
+    # Prefer using this path with model strings like:
+    # - Serverless: "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+    # - Dedicated:  "HK123/Qwen2.5-Math-72B-Instruct-1d5fc83c"
+    elif model_type in {'nv/dev', 'together'}:
         answer = ''
         updated_messages = []
         for m in messages:

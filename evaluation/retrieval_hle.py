@@ -16,6 +16,7 @@
 import os
 import json
 import asyncio
+import threading
 from typing import List, Optional
 import argparse
 import faiss
@@ -28,6 +29,21 @@ import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 from tavily import TavilyClient
+
+# HuggingFace Hub fast-download mode (`HF_HUB_ENABLE_HF_TRANSFER=1`) requires
+# `hf_transfer`. If the env var is enabled but the package isn't installed,
+# HuggingFace raises a ValueError during model/tokenizer downloads. To make
+# `retrieval_hle.py` robust for smoke tests / fresh envs, auto-disable it.
+if os.environ.get("HF_HUB_ENABLE_HF_TRANSFER") in {"1", "true", "True"}:
+    try:
+        import hf_transfer  # type: ignore[unused-ignore]  # noqa: F401
+    except Exception:
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+        print(
+            "[retrieval_hle] WARNING: HF_HUB_ENABLE_HF_TRANSFER=1 but 'hf_transfer' is not installed; "
+            "disabling fast downloads. Install with `pip install hf_transfer` to re-enable.",
+            flush=True,
+        )
 
 def load_corpus(corpus_path: str):
     corpus = datasets.load_dataset(
@@ -192,14 +208,26 @@ class BaseRetriever:
 class DenseRetriever(BaseRetriever):
     def __init__(self, config):
         super().__init__(config)
+        print(f"[retrieval_hle] Loading FAISS index: {self.index_path}", flush=True)
         self.index = faiss.read_index(self.index_path)
         if config.faiss_gpu:
+            try:
+                print(f"[retrieval_hle] Moving FAISS index to GPU(s) (visible_gpus={faiss.get_num_gpus()}) ...", flush=True)
+            except Exception:
+                print("[retrieval_hle] Moving FAISS index to GPU(s) ...", flush=True)
             co = faiss.GpuMultipleClonerOptions()
             co.useFloat16 = True
             co.shard = True
             self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
+            print("[retrieval_hle] FAISS index moved to GPU(s).", flush=True)
 
+        print(f"[retrieval_hle] Loading corpus: {self.corpus_path}", flush=True)
         self.corpus = load_corpus(self.corpus_path)
+        try:
+            print(f"[retrieval_hle] Corpus loaded (size={len(self.corpus)})", flush=True)
+        except Exception:
+            print("[retrieval_hle] Corpus loaded.", flush=True)
+        print(f"[retrieval_hle] Loading embedding model: {config.retrieval_model_path}", flush=True)
         self.encoder = Encoder(
             model_name=self.retrieval_method,
             model_path=config.retrieval_model_path,
@@ -207,10 +235,16 @@ class DenseRetriever(BaseRetriever):
             max_length=config.retrieval_query_max_length,
             use_fp16=config.retrieval_use_fp16
         )
+        print("[retrieval_hle] Embedding model loaded.", flush=True)
         self.topk = config.retrieval_topk
         self.batch_size = config.retrieval_batch_size
+        print(f"[retrieval_hle] Loading example_id_file: {config.example_id_file}", flush=True)
         with open(config.example_id_file) as f:
             self.example_ids = json.load(f)
+        try:
+            print(f"[retrieval_hle] example_ids loaded (keys={len(self.example_ids)})", flush=True)
+        except Exception:
+            print("[retrieval_hle] example_ids loaded.", flush=True)
 
     def _search(self, query: str, num: int = None, return_score: bool = False):
         if num is None:
@@ -323,6 +357,11 @@ class QueryRequest(BaseModel):
     new_cache_dir: str = None
 
 app = FastAPI()
+_RETRIEVE_LOCK = threading.Lock()
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 @app.post("/retrieve")
@@ -340,13 +379,20 @@ def retrieve_endpoint(request: QueryRequest):
     if not request.topk:
         request.topk = config.retrieval_topk  # fallback to default
 
-    # Perform batch retrieval
-    results, scores = retriever.batch_search(
-        query_list=request.queries,
-        num=1000,
-        return_score=request.return_scores,
-        eid=request.eid
-    )
+    # Perform retrieval on GPU-backed components (encoder + FAISS GPU index).
+    #
+    # NOTE: Under high concurrency, FastAPI runs sync endpoints in a threadpool.
+    # FAISS GPU indices + a single shared torch model are not thread-safe for
+    # concurrent calls across threads; we guard the critical section to prevent
+    # GPU stack allocator assertion failures (seen as:
+    #   faiss::gpu::StackDeviceMemory::Stack::returnAlloc assertion).
+    with _RETRIEVE_LOCK:
+        results, scores = retriever.batch_search(
+            query_list=request.queries,
+            num=1000,
+            return_score=request.return_scores,
+            eid=request.eid,
+        )
 
     # Format response
     resp = []
@@ -436,10 +482,16 @@ parser.add_argument('--tavily_key', type=str, default="")
 parser.add_argument('--port', type=int)
 args = parser.parse_args()
 
+index_dir = os.environ.get("INDEX_DIR")
+if not index_dir:
+    raise SystemExit(
+        "ERROR: INDEX_DIR env var is not set. It must point to a directory containing eval.index and eval.jsonl."
+    )
+
 config = Config(
     retrieval_method='qwen',  # or "dense"
-    index_path=os.path.join(os.environ.get('INDEX_DIR',None),'eval.index'),
-    corpus_path=os.path.join(os.environ.get('INDEX_DIR',None),'eval.jsonl'),
+    index_path=os.path.join(index_dir, 'eval.index'),
+    corpus_path=os.path.join(index_dir, 'eval.jsonl'),
     retrieval_topk=5,
     faiss_gpu=True,
     retrieval_model_path='Qwen/Qwen3-Embedding-8B',
@@ -452,7 +504,23 @@ config = Config(
     tavily_key=args.tavily_key
 )
 
+print(
+    "[retrieval_hle] Config:\n"
+    f"  INDEX_DIR={os.environ.get('INDEX_DIR')}\n"
+    f"  index_path={config.index_path}\n"
+    f"  corpus_path={config.corpus_path}\n"
+    f"  retrieval_model_path={config.retrieval_model_path}\n"
+    f"  faiss_gpu={config.faiss_gpu}\n"
+    f"  port={args.port}\n"
+    f"  new_cache_dir={args.new_cache_dir}\n"
+    f"  example_id_file={args.example_id_file}\n"
+    f"  tavily_key_set={bool(args.tavily_key)}",
+    flush=True,
+)
+
 retriever = DenseRetriever(config)
 
+print(f"[retrieval_hle] Starting uvicorn on 0.0.0.0:{args.port}", flush=True)
 uvicorn.run(app, host="0.0.0.0", port=args.port)
 
+# 

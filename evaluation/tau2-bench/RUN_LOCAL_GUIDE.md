@@ -41,7 +41,7 @@ cd evaluation/tau2-bench
 pip install -e .
 ```
 
-#### 方案 B: vLLM 0.10.1（Blackwell GPU 支持）
+#### plan B: vLLM 0.10.1（Blackwell GPU 支持）
 
 ```bash
 conda create -n vllm1 python=3.12 -y
@@ -61,8 +61,7 @@ pip install vllm==0.10.1 transformers
 pip install hf_transfer
 
 # 安装 tau2-bench
-cd evaluation/tau2-bench
-pip install -e .
+cd evaluation/tau2-bench && pip install -e .
 ```
 
 **注意**: transformers==4.57.3 + vLLM==0.10.1 已在 Blackwell GPU 上验证通过。

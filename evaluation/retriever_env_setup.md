@@ -11,23 +11,87 @@
 ### 完整安装步骤
 
 ```bash
-# 1. 创建环境
+# 0) 进入 conda（不要用 conda run）
+# 根据 cursor chat 里的踩坑记录：用 conda.sh 激活最稳（而不是 source env/bin/activate）。
+source /root/miniconda3/etc/profile.d/conda.sh
+
+# 1) 创建环境
 conda create -n retriever python=3.12 -y
 conda activate retriever
 
-# 2. 安装 PyTorch 2.7.1 + CUDA 12.8 (支持 Blackwell)
-pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
-    --index-url https://download.pytorch.org/whl/cu128
+# (可选) 把 HF cache 放在 /workspace，避免写爆 /root overlay
+# export HF_HOME=/workspace/cache/huggingface
 
-# 3. 安装 Faiss-GPU (通过 Conda)
+# 2) 先用 conda-forge 固定科学栈版本（关键：避免 pip 拉 numpy==2.x 导致 faiss/scipy ABI 冲突）
+# 触发过的问题：torchvision 通过 pip 拉了 numpy==2.3.5，导致 scipy/transformers 报 ABI mismatch。
+conda install -y -c conda-forge --force-reinstall \
+  "numpy<2" "scipy<2" "scikit-learn<2" numpy-base
+
+# 3) 安装 PyTorch 2.7.1 + CUDA 12.8 (支持 Blackwell)
+# 注意：这里不要用 pip -U，也不要让 pip 升级 numpy（上一步已固定 numpy<2）。
+pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
+  --index-url https://download.pytorch.org/whl/cu128
+
+# 4) 安装 Faiss-GPU (通过 Conda)
 conda install -y -c pytorch -c nvidia faiss-gpu
 
-# 4. 安装 Flash Attention 2 (预编译轮子)
+# 5) 安装 Flash Attention 2 (预编译轮子)
 pip install packaging ninja psutil
 pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
 
-# 5. 安装其他依赖
+# 6) 安装其他依赖
 pip install transformers datasets pyserini uvicorn fastapi tavily-python
+```
+
+---
+
+## 🔧 Workaround：如果你已经踩到 `numpy/scipy` 与 `faiss-gpu` 冲突
+
+来自 cursor chat 的可复现根因：`pip install torchvision ...` 会在新环境里拉最新 `numpy==2.x`，然后导致 `scipy`/`faiss-gpu`/`transformers` 出现 ABI 不一致（典型报错类似 `ValueError: All ufuncs must have type numpy.ufunc ...`）。
+
+推荐修复方式（**不使用 conda run**）：
+
+```bash
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate retriever
+
+# 1) 先把 pip 拉进来的 numpy/scipy/sklearn 清掉
+python -m pip uninstall -y numpy scipy scikit-learn || true
+
+# 2) 用 conda-forge 强制重装一致版本（numpy<2）
+conda install -y -c conda-forge --force-reinstall \
+  "numpy<2" "scipy<2" "scikit-learn<2" numpy-base
+
+# 3) 快速 sanity check
+python - <<'PY'
+import numpy, scipy, sklearn
+print("numpy", numpy.__version__, numpy.__file__)
+print("scipy", scipy.__version__)
+print("sklearn", sklearn.__version__)
+PY
+```
+
+如果你后续又跑了 `pip install -U ...` 并再次把 numpy 升到 2.x，重复上面的修复即可。
+
+---
+
+## 🧩 Workaround：HF_HUB_ENABLE_HF_TRANSFER=1 导致启动崩溃
+
+在 cursor chat 里出现过：
+`ValueError: Fast download using 'hf_transfer' is enabled (HF_HUB_ENABLE_HF_TRANSFER=1) but 'hf_transfer' package is not available`
+
+你有两个选择：
+
+1) 安装 `hf_transfer`：
+
+```bash
+pip install hf_transfer
+```
+
+2) 或禁用它：
+
+```bash
+export HF_HUB_ENABLE_HF_TRANSFER=0
 ```
 
 ## 🧪 验证结果
@@ -76,4 +140,3 @@ triton==3.3.1
 ```bash
 python test_env.py
 ```
-
