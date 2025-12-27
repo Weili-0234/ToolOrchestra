@@ -17,7 +17,10 @@ import os
 import json
 import asyncio
 import threading
-from typing import List, Optional
+import time
+import queue
+from dataclasses import dataclass
+from typing import List, Optional, Any
 import argparse
 import faiss
 import torch
@@ -178,7 +181,6 @@ class Encoder:
         query_emb = query_emb.astype(np.float32, order="C")
 
         del inputs, output
-        torch.cuda.empty_cache()
 
         return query_emb
 
@@ -241,6 +243,14 @@ class DenseRetriever(BaseRetriever):
         print(f"[retrieval_hle] Loading example_id_file: {config.example_id_file}", flush=True)
         with open(config.example_id_file) as f:
             self.example_ids = json.load(f)
+        # Speed up membership checks in retrieval filtering.
+        # `example_ids` is expected to be {eid: [doc_id, ...]}.
+        try:
+            for _eid, _ids in list(self.example_ids.items()):
+                if isinstance(_ids, list):
+                    self.example_ids[_eid] = set(_ids)
+        except Exception:
+            pass
         try:
             print(f"[retrieval_hle] example_ids loaded (keys={len(self.example_ids)})", flush=True)
         except Exception:
@@ -259,6 +269,17 @@ class DenseRetriever(BaseRetriever):
         else:
             return results
 
+    def raw_batch_search(self, query_list: List[str], num: int) -> tuple[Any, Any]:
+        """
+        Batched GPU retrieval without any post-filtering or doc loading.
+        Returns (scores, idxs) as returned by FAISS, shaped [B, num].
+        """
+        if isinstance(query_list, str):
+            query_list = [query_list]
+        batch_emb = self.encoder.encode(query_list)
+        batch_scores, batch_idxs = self.index.search(batch_emb, k=int(num))
+        return batch_scores, batch_idxs
+
     def _batch_search(self, query_list: List[str], num: int = None, return_score: bool = False, eid: str = None):
         if isinstance(query_list, str):
             query_list = [query_list]
@@ -267,7 +288,7 @@ class DenseRetriever(BaseRetriever):
 
         results = []
         scores = []
-        for start_idx in tqdm(range(0, len(query_list), self.batch_size), desc='Retrieval process: '):
+        for start_idx in tqdm(range(0, len(query_list), self.batch_size), desc='Retrieval process: ', disable=True):
             query_batch = query_list[start_idx:start_idx + self.batch_size]
             batch_emb = self.encoder.encode(query_batch)
             batch_scores, batch_idxs = self.index.search(batch_emb, k=num)
@@ -296,7 +317,6 @@ class DenseRetriever(BaseRetriever):
             scores.extend(updated_scores)
 
             del batch_emb, batch_scores, batch_idxs, query_batch, flat_idxs, batch_results,updated_batch_results,updated_scores
-            torch.cuda.empty_cache()
 
         if return_score:
             return results, scores
@@ -359,13 +379,254 @@ class QueryRequest(BaseModel):
 app = FastAPI()
 _RETRIEVE_LOCK = threading.Lock()
 
+_BATCH_QUEUE: Optional["BatchQueue"] = None
+
+
+@dataclass(frozen=True)
+class _PendingRetrieve:
+    query: str
+    eid: Optional[str]
+    topk: int
+    return_scores: bool
+    loop: asyncio.AbstractEventLoop
+    fut: asyncio.Future
+
+
+class BatchQueue:
+    """
+    Thread-safe queue that groups independent /retrieve requests into a micro-batch.
+
+    Flush policy:
+    - flush immediately when batch reaches max_batch_size
+    - otherwise flush when the oldest item has waited >= max_wait_ms
+    """
+
+    def __init__(self, max_batch_size: int = 256, max_wait_ms: float = 5.0):
+        if max_batch_size <= 0:
+            raise ValueError("max_batch_size must be > 0")
+        if max_wait_ms <= 0:
+            raise ValueError("max_wait_ms must be > 0")
+        self.max_batch_size = int(max_batch_size)
+        self.max_wait_s = float(max_wait_ms) / 1000.0
+        self._q: "queue.Queue[_PendingRetrieve]" = queue.Queue()
+
+    def put(self, item: _PendingRetrieve) -> None:
+        self._q.put(item)
+
+    def get_batch(self) -> list[_PendingRetrieve]:
+        first = self._q.get()  # blocks until at least one request arrives
+        batch: list[_PendingRetrieve] = [first]
+        t0 = time.perf_counter()
+        while len(batch) < self.max_batch_size:
+            remaining = self.max_wait_s - (time.perf_counter() - t0)
+            if remaining <= 0:
+                break
+            try:
+                batch.append(self._q.get(timeout=remaining))
+            except queue.Empty:
+                break
+        return batch
+
+
+def _safe_set_future_result(fut: asyncio.Future, value: Any) -> None:
+    try:
+        if fut.done():
+            return
+        fut.set_result(value)
+    except Exception:
+        # If the client disconnected/cancelled, ignore.
+        return
+
+
+def _safe_set_future_exception(fut: asyncio.Future, exc: BaseException) -> None:
+    try:
+        if fut.done():
+            return
+        fut.set_exception(exc)
+    except Exception:
+        return
+
+
+def _tavily_fallback_append(resp0: list[Any], query: str, eid: str) -> None:
+    """
+    Best-effort Tavily search/extract fallback. Appends extracted content into resp0.
+    Mirrors the previous synchronous endpoint behavior.
+    """
+    if not getattr(config, "tavily_key", None):
+        return
+
+    tavily_client = TavilyClient(config.tavily_key)
+    try:
+        response = tavily_client.search(
+            query=query,
+            search_depth="advanced",
+            max_results=20,
+            chunks_per_source=5,
+        )
+    except Exception:
+        return
+
+    try:
+        cache_dir = os.path.join(config.new_cache_dir, eid)
+        os.makedirs(cache_dir, exist_ok=True)
+        search_idx = 0
+        while os.path.isfile(os.path.join(cache_dir, f"search_{search_idx}.json")):
+            search_idx += 1
+        with open(os.path.join(cache_dir, f"search_{search_idx}.json"), "w") as f:
+            json.dump(response, f, indent=2)
+    except Exception:
+        # Cache is best-effort.
+        search_idx = 0
+
+    def extract_web(extract_argument):
+        try:
+            extraction = tavily_client.extract(
+                urls=[extract_argument["url"]],
+                extract_depth="advanced",
+                format="text",
+            )
+        except Exception:
+            return None
+        try:
+            cache_dir = os.path.join(config.new_cache_dir, eid)
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(os.path.join(cache_dir, f"extraction_{search_idx}_{extract_argument['extract_id']}.json"), "w") as f:
+                json.dump(extraction, f, indent=2)
+        except Exception:
+            pass
+        extract_argument["raw_extraction"] = extraction
+        return extract_argument
+
+    extraction_arguments = []
+    for extract_id, r in enumerate(response.get("results", [])):
+        extraction_arguments.append(
+            [extract_web, {"extract_id": extract_id, "url": r.get("url"), "score": r.get("score")}]
+        )
+
+    all_extraction_results = []
+    for argument in extraction_arguments:
+        if not argument[1].get("url"):
+            continue
+        all_extraction_results.append(argument[0](argument[1]))
+
+    extraction_results = []
+    for extraction_return in all_extraction_results:
+        if not extraction_return:
+            continue
+        extract_content = ""
+        try:
+            for one_extraction_result in extraction_return["raw_extraction"].get("results", []):
+                extract_content += one_extraction_result.get("raw_content", "") + "\n\n"
+        except Exception:
+            continue
+        if len(extract_content.strip()) > 100:
+            extraction_results.append([extract_content, extraction_return.get("score", 0.0)])
+
+    if len(extraction_results) > 1:
+        extraction_results = sorted(extraction_results, key=lambda x: x[1], reverse=True)
+
+    for new_doc_id, new_search in enumerate(extraction_results):
+        if not (isinstance(new_search, list) and isinstance(new_search[0], str)):
+            continue
+        # Keep legacy shape: {"document": {"content": ...}, "score": -N}
+        resp0.append({"document": {"content": new_search[0]}, "score": -new_doc_id - 1})
+
+
+def _format_one_response(
+    *,
+    query: str,
+    eid: Optional[str],
+    topk: int,
+    return_scores: bool,
+    scores_row: Any,
+    idxs_row: Any,
+) -> list[Any]:
+    # NOTE: Response shape must remain: a list with exactly one element (per-request),
+    # i.e. results[0] is the list of hits.
+    resp0: list[Any] = []
+
+    allowed_ids = None
+    if eid is not None:
+        allowed_ids = retriever.example_ids.get(eid)
+    if allowed_ids is None:
+        allowed_ids = set()
+
+    # Iterate in FAISS rank order.
+    for idx, score in zip(idxs_row, scores_row):
+        try:
+            score_f = float(score)
+        except Exception:
+            continue
+        if score_f <= 0.1:
+            continue
+        try:
+            doc = retriever.corpus[int(idx)]
+        except Exception:
+            continue
+        try:
+            doc_id = int(doc.get("id"))
+        except Exception:
+            continue
+        if doc_id not in allowed_ids:
+            continue
+        content = doc.get("content") if isinstance(doc, dict) else None
+        if content is None and isinstance(doc, dict):
+            content = doc.get("contents")
+        if not isinstance(content, str) or len(content) <= 100:
+            continue
+        if return_scores:
+            resp0.append({"document": doc, "score": score_f})
+        else:
+            resp0.append(doc)
+        if len(resp0) >= topk:
+            break
+
+    # Optional web fallback via Tavily (legacy behavior).
+    if len(resp0) < 3 and getattr(config, "tavily_key", None) and isinstance(eid, str) and eid:
+        _tavily_fallback_append(resp0, query=query, eid=eid)
+
+    return [resp0]
+
+
+def _batch_worker_main(*, batch_queue: BatchQueue, k: int = 100) -> None:
+    """
+    Background worker: micro-batches independent /retrieve requests into a single
+    GPU encode + FAISS search call, then post-processes per-request (eid filter).
+    """
+    while True:
+        batch = batch_queue.get_batch()
+        if not batch:
+            continue
+
+        try:
+            queries = [b.query for b in batch]
+            # GPU path (single encode + single search)
+            batch_scores, batch_idxs = retriever.raw_batch_search(queries, num=int(k))
+
+            # Per-request post-processing (eid filtering + formatting)
+            for i, b in enumerate(batch):
+                resp = _format_one_response(
+                    query=b.query,
+                    eid=b.eid,
+                    topk=b.topk,
+                    return_scores=b.return_scores,
+                    scores_row=batch_scores[i],
+                    idxs_row=batch_idxs[i],
+                )
+                b.loop.call_soon_threadsafe(_safe_set_future_result, b.fut, resp)
+        except Exception as e:
+            # Fail the whole batch; clients will see 500s (but server stays alive).
+            for b in batch:
+                b.loop.call_soon_threadsafe(_safe_set_future_exception, b.fut, e)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
 @app.post("/retrieve")
-def retrieve_endpoint(request: QueryRequest):
+async def retrieve_endpoint(request: QueryRequest):
     """
     Endpoint that accepts queries and performs retrieval.
     Input format:
@@ -375,103 +636,26 @@ def retrieve_endpoint(request: QueryRequest):
       "return_scores": true
     }
     """
-    assert len(request.queries)==1,"We now assume single query search"
-    if not request.topk:
-        request.topk = config.retrieval_topk  # fallback to default
+    assert len(request.queries) == 1, "We now assume single query search"
+    topk = int(request.topk or config.retrieval_topk)
 
-    # Perform retrieval on GPU-backed components (encoder + FAISS GPU index).
-    #
-    # NOTE: Under high concurrency, FastAPI runs sync endpoints in a threadpool.
-    # FAISS GPU indices + a single shared torch model are not thread-safe for
-    # concurrent calls across threads; we guard the critical section to prevent
-    # GPU stack allocator assertion failures (seen as:
-    #   faiss::gpu::StackDeviceMemory::Stack::returnAlloc assertion).
-    with _RETRIEVE_LOCK:
-        results, scores = retriever.batch_search(
-            query_list=request.queries,
-            num=1000,
-            return_score=request.return_scores,
+    q = _BATCH_QUEUE
+    if q is None:
+        raise RuntimeError("Retrieval micro-batching queue is not initialized")
+
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    q.put(
+        _PendingRetrieve(
+            query=request.queries[0],
             eid=request.eid,
+            topk=topk,
+            return_scores=bool(request.return_scores),
+            loop=loop,
+            fut=fut,
         )
-
-    # Format response
-    resp = []
-    for i, single_result in enumerate(results):
-        if request.return_scores:
-            # If scores are returned, combine them with results
-            combined = []
-            for doc, score in zip(single_result, scores[i]):
-                if len(doc["content"])>100 and score>0.1:
-                    combined.append({"document": doc, "score": score})
-                if len(combined)>=request.topk:
-                    break
-            resp.append(combined)
-        else:
-            resp.append(single_result)
-    # Optional web fallback via Tavily. If no key is configured, skip (return what we have).
-    if len(resp[0]) < 3 and config.tavily_key:
-        tavily_client = TavilyClient(config.tavily_key)
-        try:
-            response = tavily_client.search(
-                query=request.queries[0],
-                search_depth="advanced",
-                max_results=20,
-                chunks_per_source=5
-            )
-        except Exception as tavily_search_error:
-            return resp
-        if not os.path.isdir(os.path.join(config.new_cache_dir,request.eid)):
-            os.makedirs(os.path.join(config.new_cache_dir,request.eid),exist_ok=True)
-        search_idx = 0
-        while os.path.isfile(os.path.join(config.new_cache_dir,request.eid,f"search_{search_idx}.json")):
-            search_idx += 1
-        with open(os.path.join(config.new_cache_dir,request.eid,f"search_{search_idx}.json"),'w') as f:
-            json.dump(response,f,indent=2)
-
-        def extract_web(extract_argument):
-            try:
-                extraction = tavily_client.extract(
-                    urls=[extract_argument['url']],
-                    extract_depth="advanced",
-                    format="text"
-                )
-            except Exception as tavily_extract_error:
-                return
-            with open(os.path.join(config.new_cache_dir,request.eid,f"extraction_{search_idx}_{extract_argument['extract_id']}.json"),'w') as f:
-                json.dump(extraction,f,indent=2)
-            extract_argument['raw_extraction'] = extraction
-            return extract_argument
-
-        extraction_arguments = []
-        for extract_id,r in enumerate(response['results']):
-            extraction_arguments.append([extract_web,{
-                'extract_id': extract_id,
-                'url': r['url'],
-                'score': r['score']
-            }])
-        all_extraction_results = []
-        for argument in extraction_arguments:
-            all_extraction_results.append(argument[0](argument[1]))
-        extraction_results = []
-        for extraction_return in all_extraction_results:
-            if not extraction_return:
-                continue
-            extract_content = ''
-            for one_extraction_result in extraction_return['raw_extraction']["results"]:
-                extract_content += one_extraction_result["raw_content"]+'\n\n'
-            if len(extract_content.strip())>100:
-                extraction_results.append([extract_content,extraction_return['score']])
-            
-        if len(extraction_results)>1:
-            extraction_results = sorted(extraction_results,key=lambda x:x[1],reverse=True)
-        for new_doc_id, new_search in enumerate(extraction_results):
-            assert isinstance(new_search,list)
-            assert isinstance(new_search[0],str)
-            resp[0].append({
-                "document": {'content': new_search[0]},
-                'score': -new_doc_id-1
-            })
-    return resp
+    )
+    return await fut
 
 
 import argparse
@@ -520,6 +704,19 @@ print(
 )
 
 retriever = DenseRetriever(config)
+
+_BATCH_QUEUE = BatchQueue(max_batch_size=256, max_wait_ms=5.0)
+_BATCH_WORKER = threading.Thread(
+    target=_batch_worker_main,
+    kwargs={"batch_queue": _BATCH_QUEUE, "k": 100},
+    daemon=True,
+)
+_BATCH_WORKER.start()
+print(
+    "[retrieval_hle] Micro-batching enabled "
+    f"(max_batch_size={_BATCH_QUEUE.max_batch_size}, max_wait_ms={_BATCH_QUEUE.max_wait_s * 1000.0:.1f}, k=100).",
+    flush=True,
+)
 
 print(f"[retrieval_hle] Starting uvicorn on 0.0.0.0:{args.port}", flush=True)
 uvicorn.run(app, host="0.0.0.0", port=args.port)
