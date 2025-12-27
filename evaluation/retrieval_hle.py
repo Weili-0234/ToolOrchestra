@@ -408,7 +408,8 @@ def retrieve_endpoint(request: QueryRequest):
             resp.append(combined)
         else:
             resp.append(single_result)
-    if len(resp[0])<3:
+    # Optional web fallback via Tavily. If no key is configured, skip (return what we have).
+    if len(resp[0]) < 3 and config.tavily_key:
         tavily_client = TavilyClient(config.tavily_key)
         try:
             response = tavily_client.search(
