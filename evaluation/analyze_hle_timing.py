@@ -150,6 +150,14 @@ def main() -> int:
     src.add_argument("--log-path", type=str, help="Path to a single HLE log file (e.g. hle.log)")
     src.add_argument("--log-dir", type=str, help="Directory containing HLE log file(s)")
     p.add_argument("--log-glob", type=str, default="hle*.log", help="Glob inside --log-dir (default: hle*.log)")
+    p.add_argument(
+        "--all-runs",
+        action="store_true",
+        help=(
+            "Analyze all runs found in the provided log file(s). "
+            "By default, if a run_start marker exists, we only analyze the latest run segment."
+        ),
+    )
     p.add_argument("--out-dir", type=str, default=None, help="Output directory (default: same as log file/dir)")
     p.add_argument("--out-prefix", type=str, default="hle_profile", help="Output filename prefix")
     p.add_argument("--bins", type=int, default=10, help="Number of bins for histograms (default: 10)")
@@ -181,14 +189,15 @@ def main() -> int:
     for lp in log_paths:
         lines.extend(lp.read_text(encoding="utf-8", errors="replace").splitlines())
 
-    # If multiple runs are appended into the same log file, only analyze the latest run.
-    # (We emit a type=run_start marker at the beginning of each eval_hle_local.py execution.)
-    last_run_start_idx: Optional[int] = None
-    for i, line in enumerate(lines):
-        if "type=run_start" in line:
-            last_run_start_idx = i
-    if last_run_start_idx is not None:
-        lines = lines[last_run_start_idx:]
+    if not args.all_runs:
+        # If multiple runs are appended into the same log file, only analyze the latest run.
+        # (We emit a type=run_start marker at the beginning of each eval_hle_local.py execution.)
+        last_run_start_idx: Optional[int] = None
+        for i, line in enumerate(lines):
+            if "type=run_start" in line:
+                last_run_start_idx = i
+        if last_run_start_idx is not None:
+            lines = lines[last_run_start_idx:]
 
     # Tool call metrics
     tool_all_ms: list[float] = []

@@ -140,12 +140,12 @@ class VLLMServerManager:
         """Add a server to manage"""
         self.servers.append(server)
 
-    def start_all(self, stagger_delay: int = 60):
+    def start_all(self, log_dir: str = "logs", stagger_delay: int = 60):
         """Start all servers with staggered delays"""
         log(f"Starting {len(self.servers)} vLLM server(s)...")
 
         for i, server in enumerate(self.servers):
-            server.start()
+            server.start(log_dir=log_dir)
             if i < len(self.servers) - 1:  # Don't sleep after the last server
                 log(f"Waiting {stagger_delay}s before starting next server...")
                 time.sleep(stagger_delay)
@@ -590,7 +590,7 @@ Example usage:
 
         # Start all servers
         try:
-            manager.start_all(stagger_delay=args.stagger_delay)
+            manager.start_all(log_dir=args.log_dir, stagger_delay=args.stagger_delay)
 
             # Wait for all servers to be ready
             if not manager.wait_all_ready(max_wait=args.server_timeout):

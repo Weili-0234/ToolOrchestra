@@ -529,7 +529,7 @@ def _tavily_fallback_append(resp0: list[Any], query: str, eid: str) -> None:
         if not (isinstance(new_search, list) and isinstance(new_search[0], str)):
             continue
         # Keep legacy shape: {"document": {"content": ...}, "score": -N}
-        resp0.append({"document": {"content": new_search[0]}, "score": -new_doc_id - 1})
+        resp0.append({"document": {"content": new_search[0]}, "score": -new_doc_id - 1, "source": "tavily"})
 
 
 def _format_one_response(
@@ -575,7 +575,7 @@ def _format_one_response(
         if not isinstance(content, str) or len(content) <= 100:
             continue
         if return_scores:
-            resp0.append({"document": doc, "score": score_f})
+            resp0.append({"document": doc, "score": score_f, "source": "local"})
         else:
             resp0.append(doc)
         if len(resp0) >= topk:
@@ -665,6 +665,24 @@ parser.add_argument('--new_cache_dir', type=str, default='cache/hle')
 parser.add_argument('--example_id_file', type=str, default='examples.json')
 parser.add_argument('--tavily_key', type=str, default="")
 parser.add_argument('--port', type=int)
+parser.add_argument(
+    "--faiss_k",
+    type=int,
+    default=int(os.environ.get("RETRIEVAL_FAISS_K", "1000")),
+    help="FAISS k for candidate retrieval before eid filtering (default: 1000 or $RETRIEVAL_FAISS_K).",
+)
+parser.add_argument(
+    "--max_batch_size",
+    type=int,
+    default=int(os.environ.get("RETRIEVAL_MAX_BATCH_SIZE", "256")),
+    help="Micro-batch max size (default: 256 or $RETRIEVAL_MAX_BATCH_SIZE).",
+)
+parser.add_argument(
+    "--max_wait_ms",
+    type=float,
+    default=float(os.environ.get("RETRIEVAL_MAX_WAIT_MS", "5")),
+    help="Micro-batch flush timeout in ms (default: 5 or $RETRIEVAL_MAX_WAIT_MS).",
+)
 args = parser.parse_args()
 
 index_dir = os.environ.get("INDEX_DIR")
@@ -705,16 +723,16 @@ print(
 
 retriever = DenseRetriever(config)
 
-_BATCH_QUEUE = BatchQueue(max_batch_size=256, max_wait_ms=5.0)
+_BATCH_QUEUE = BatchQueue(max_batch_size=int(args.max_batch_size), max_wait_ms=float(args.max_wait_ms))
 _BATCH_WORKER = threading.Thread(
     target=_batch_worker_main,
-    kwargs={"batch_queue": _BATCH_QUEUE, "k": 100},
+    kwargs={"batch_queue": _BATCH_QUEUE, "k": int(args.faiss_k)},
     daemon=True,
 )
 _BATCH_WORKER.start()
 print(
     "[retrieval_hle] Micro-batching enabled "
-    f"(max_batch_size={_BATCH_QUEUE.max_batch_size}, max_wait_ms={_BATCH_QUEUE.max_wait_s * 1000.0:.1f}, k=100).",
+    f"(max_batch_size={_BATCH_QUEUE.max_batch_size}, max_wait_ms={_BATCH_QUEUE.max_wait_s * 1000.0:.1f}, k={int(args.faiss_k)}).",
     flush=True,
 )
 

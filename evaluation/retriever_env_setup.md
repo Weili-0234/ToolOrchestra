@@ -7,6 +7,7 @@
 - **Python**: 3.12
 - **CUDA**: 12.8
 - **PyTorch**: 2.7.1 (正式版，非 Nightly)
+- **Container Image**: `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`
 
 ### 完整安装步骤
 
@@ -40,7 +41,7 @@ pip install packaging ninja psutil
 pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
 
 # 6) 安装其他依赖
-pip install transformers datasets pyserini uvicorn fastapi tavily-python
+pip install transformers datasets pyserini uvicorn fastapi tavily-python hf_transfer
 ```
 
 ---

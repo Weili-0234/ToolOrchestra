@@ -168,226 +168,326 @@ def cut_seq(seq,l):
 def call_tool(arguments):
     tool_name = arguments.get("tool")
     eid = arguments.get("eid")
-    with task_context(task_id=str(arguments.get("id", "unknown")), domain="hle", eid=eid if isinstance(eid, int) else None):
+
+    with task_context(
+        task_id=str(arguments.get("id", "unknown")),
+        domain="hle",
+        eid=eid if isinstance(eid, int) else None,
+    ):
         set_step_context(arguments.get("step"))
         t0 = time.perf_counter()
         try:
-            start_time = time.time()
-            if arguments['tool']=='enhance_reasoning':
-                supported_models = [MODEL_MAPPING[m] for m in ALL_TOOLS['enhance_reasoning']['model']]
-                assert arguments['model'] in supported_models,f"Model {arguments['model']} is not supported in enhance_reasoning. Support models: {supported_models}"
-                prompt = arguments['context_str'].strip()+'\n\n'
-                prompt += f"Question: {arguments['problem']}\nInstead of directly answering the question, please write additional python code that will give intermidiate results after execution. Wrap the code within ```python and ```. The code should be self-contained with all the import and initialization."
-                model_name = arguments['model']
-                response = ''
-                if 'gpt-5' in model_name.lower():
-                    response = get_llm_response(model=model_name,messages=prompt,return_raw_response=True,temperature=1,max_length=40000)
-                elif 'qwen2.5-coder' in model_name.lower():
+            # Keep original structure from eval_hle.py, but with local expert routing + profiling.
+            _ = time.time()  # start_time (legacy; kept for compatibility)
+
+            if arguments["tool"] == "enhance_reasoning":
+                supported_models = [MODEL_MAPPING[m] for m in ALL_TOOLS["enhance_reasoning"]["model"]]
+                assert (
+                    arguments["model"] in supported_models
+                ), f"Model {arguments['model']} is not supported in enhance_reasoning. Support models: {supported_models}"
+
+                prompt = arguments["context_str"].strip() + "\n\n"
+                prompt += (
+                    f"Question: {arguments['problem']}\n"
+                    "Instead of directly answering the question, please write additional python code that will give intermidiate results after execution. "
+                    "Wrap the code within ```python and ```. The code should be self-contained with all the import and initialization."
+                )
+                model_name = arguments["model"]
+
+                response = ""
+                if "gpt-5" in model_name.lower():
+                    response = get_llm_response(
+                        model=model_name,
+                        messages=prompt,
+                        return_raw_response=True,
+                        temperature=1,
+                        max_length=40000,
+                    )
+                elif "qwen2.5-coder" in model_name.lower():
                     response = get_llm_response(
                         model=_together_model_for(model_name),
                         messages=prompt,
                         return_raw_response=True,
-                        model_type='nv/dev',
+                        model_type="nv/dev",
                         max_length=8000,
                         temperature=0.2,
                     )
-                if isinstance(response,str):
-                    arguments['generated_code'] = ''
-                    arguments['exec_result'] = ''
+
+                if isinstance(response, str):
+                    arguments["generated_code"] = ""
+                    arguments["exec_result"] = ""
                     return arguments
+
                 try:
-                    generated_code = response.choices[0].message.content.split('```python')[-1].split('```')[0]
-                except:
-                    generated_code = ''
-                if generated_code=='':
-                    arguments['generated_code'] = ''
-                    arguments['exec_result'] = ''
+                    generated_code = response.choices[0].message.content.split("```python")[-1].split("```")[0]
+                except Exception:
+                    generated_code = ""
+
+                if generated_code == "":
+                    arguments["generated_code"] = ""
+                    arguments["exec_result"] = ""
                     return arguments
-                code_path = str(os.path.join(arguments['cur_output_dir'],f'exec_code_{arguments["id"]}.py'))
-                with open(code_path,'w') as f:
+
+                code_path = str(os.path.join(arguments["cur_output_dir"], f'exec_code_{arguments["id"]}.py'))
+                with open(code_path, "w") as f:
                     f.write(generated_code)
-                exec_result = ''
+
+                exec_result = ""
                 exec_start = time.time()
                 try:
-                    exec_result = subprocess.run(['python', code_path], timeout=60, capture_output=True, text=True)
-                    exec_time = time.time()-exec_start
-                    exec_result = exec_result.stdout
-                    with open(os.path.join(arguments['cur_output_dir'],f'exec_out_{arguments["id"]}.txt'),'w') as f:
+                    run_ret = subprocess.run(["python", code_path], timeout=60, capture_output=True, text=True)
+                    exec_result = run_ret.stdout
+                    with open(os.path.join(arguments["cur_output_dir"], f'exec_out_{arguments["id"]}.txt'), "w") as f:
                         f.write(exec_result)
-                except Exception as e:
+                except Exception:
                     pass
-                exec_time = time.time() - exec_start
-                arguments['generated_code'] = generated_code
-                arguments['exec_result'] = exec_result
+                _ = time.time() - exec_start  # exec_time (legacy)
+
+                arguments["generated_code"] = generated_code
+                arguments["exec_result"] = exec_result
                 return arguments
-            
-            elif arguments['tool']=='answer':
-                prompt = arguments['context_str'].strip()+'\n\nProblem:\n'+arguments['problem']
-                response_str = ''
-                pred = ''
+
+            if arguments["tool"] == "answer":
+                prompt = arguments["context_str"].strip() + "\n\nProblem:\n" + arguments["problem"]
+                response_str = ""
+                pred = ""
+
                 # Measure ONLY the expert model portion (exclude evaluator call).
                 expert_t0 = time.perf_counter()
 
-                if 'qwen3' in arguments['model'].lower():
-                    model_name = arguments['model']
+                if "qwen3" in arguments["model"].lower():
+                    model_name = arguments["model"]
                     messages = [
                         {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
-                        {"role": "user", "content": prompt}
+                        {"role": "user", "content": prompt},
                     ]
-                    arguments['messages'] = messages
-                    response = get_llm_response(model=model_name,messages=messages,return_raw_response=True,model_type='vllm',max_length=8000,temperature=0.2,model_config=arguments['vllm_model_configs'][model_name],model_config_path=arguments['vllm_model_configs']['vllm_model_config_path'],model_config_idx=arguments['eid'])
-                    if isinstance(response,str):
-                        arguments['response'] = ''
-                        arguments['pred'] = ''
-                        arguments['correctness'] = False
+                    arguments["messages"] = messages
+                    response = get_llm_response(
+                        model=model_name,
+                        messages=messages,
+                        return_raw_response=True,
+                        model_type="vllm",
+                        max_length=8000,
+                        temperature=0.2,
+                        model_config=arguments["vllm_model_configs"][model_name],
+                        model_config_path=arguments["vllm_model_configs"]["vllm_model_config_path"],
+                        model_config_idx=arguments["eid"],
+                    )
+                    arguments["_expert_ms"] = (time.perf_counter() - expert_t0) * 1000.0
+                    if isinstance(response, str):
+                        arguments["response"] = ""
+                        arguments["pred"] = ""
+                        arguments["correctness"] = False
                         return arguments
                     response_str = response.choices[0].message.content
-                    if not isinstance(response_str,str) or not '\\boxed{' in response_str:
-                        pred = ''
+                    if not isinstance(response_str, str) or "\\boxed{" not in response_str:
+                        pred = ""
                     else:
-                        pred_components = response.choices[0].message.content.split('\\boxed{')[-1].split('}')[:-1]
-                        pred = '}'.join(pred_components).strip()
-                elif 'qwen2.5-math' in arguments['model'].lower():
-                    model_name = arguments['model']
+                        pred_components = response_str.split("\\boxed{")[-1].split("}")[:-1]
+                        pred = "}".join(pred_components).strip()
+
+                elif "qwen2.5-math" in arguments["model"].lower():
+                    model_name = arguments["model"]
                     messages = [
                         {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
-                        {"role": "user", "content": prompt}
+                        {"role": "user", "content": prompt},
                     ]
-                    arguments['messages'] = messages
+                    arguments["messages"] = messages
                     response = get_llm_response(
                         model=_together_model_for(model_name),
                         messages=messages,
                         return_raw_response=True,
-                        model_type='nv/dev',
+                        model_type="nv/dev",
                         max_length=2000,
                         temperature=0.2,
                     )
-                    if isinstance(response,str):
-                        arguments['response'] = ''
-                        arguments['pred'] = ''
-                        arguments['correctness'] = False
+                    arguments["_expert_ms"] = (time.perf_counter() - expert_t0) * 1000.0
+                    if isinstance(response, str):
+                        arguments["response"] = ""
+                        arguments["pred"] = ""
+                        arguments["correctness"] = False
                         return arguments
                     response_str = response.choices[0].message.content
-                    if not isinstance(response_str,str) or not '\\boxed{' in response_str:
-                        pred = ''
+                    if not isinstance(response_str, str) or "\\boxed{" not in response_str:
+                        pred = ""
                     else:
-                        pred_components = response.choices[0].message.content.split('\\boxed{')[-1].split('}')[:-1]
-                        pred = '}'.join(pred_components).strip()
-                elif 'gpt-5' in arguments['model'].lower():
-                    model_name = arguments['model']
-                    prompt += ("\n\nTake a deep breath and think hard with high reasoning, wrap the thoughts within <think> and </think>, and wrap only the exact answer without any explanation within <answer> and </answer>."
-                                "Output using the following format:\n<think>\n...\n</think>\n<answer>\n...\n</answer>")
-                    arguments['messages'] = prompt
-                    response = get_llm_response(model=model_name,messages=prompt,return_raw_response=True,max_length=40000)
-                    if isinstance(response,str):
-                        arguments['response'] = ''
-                        arguments['pred'] = ''
-                        arguments['correctness'] = False
+                        pred_components = response_str.split("\\boxed{")[-1].split("}")[:-1]
+                        pred = "}".join(pred_components).strip()
+
+                elif "gpt-5" in arguments["model"].lower():
+                    model_name = arguments["model"]
+                    prompt2 = prompt + (
+                        "\n\nTake a deep breath and think hard with high reasoning, wrap the thoughts within <think> and </think>, "
+                        "and wrap only the exact answer without any explanation within <answer> and </answer>."
+                        "Output using the following format:\n<think>\n...\n</think>\n<answer>\n...\n</answer>"
+                    )
+                    arguments["messages"] = prompt2
+                    response = get_llm_response(model=model_name, messages=prompt2, return_raw_response=True, max_length=40000)
+                    arguments["_expert_ms"] = (time.perf_counter() - expert_t0) * 1000.0
+                    if isinstance(response, str):
+                        arguments["response"] = ""
+                        arguments["pred"] = ""
+                        arguments["correctness"] = False
                         return arguments
                     response_str = response.choices[0].message.content
-                    if isinstance(response_str,str):
-                        pred = response.choices[0].message.content.split('<answer>')[-1].split('</answer>')[0].strip()
+                    if isinstance(response_str, str):
+                        pred = response_str.split("<answer>")[-1].split("</answer>")[0].strip()
                     else:
-                        pred = ''
-                elif 'llama-3.3' in arguments['model'].lower():
-                    model_name = arguments['model']
-                    prompt += "\nWrap the thinking process and explanation between <think> and </think> and wrap only the exact answer without any explanation within <answer> and </answer>."
-                    arguments['messages'] = prompt
+                        pred = ""
+
+                elif "llama-3.3" in arguments["model"].lower():
+                    model_name = arguments["model"]
+                    prompt2 = (
+                        prompt
+                        + "\nWrap the thinking process and explanation between <think> and </think> and wrap only the exact answer without any explanation within <answer> and </answer>."
+                    )
+                    arguments["messages"] = prompt2
                     response = get_llm_response(
                         model=_together_model_for(model_name),
-                        messages=[{"role":"user","content":prompt}],
+                        messages=[{"role": "user", "content": prompt2}],
                         return_raw_response=True,
-                        model_type='nv/dev',
+                        model_type="nv/dev",
                         max_length=40000,
                         temperature=0.2,
                     )
-                    if isinstance(response,str):
-                        arguments['response'] = ''
-                        arguments['pred'] = ''
-                        arguments['correctness'] = False
+                    arguments["_expert_ms"] = (time.perf_counter() - expert_t0) * 1000.0
+                    if isinstance(response, str):
+                        arguments["response"] = ""
+                        arguments["pred"] = ""
+                        arguments["correctness"] = False
                         return arguments
                     response_str = response.choices[0].message.content
-                    if isinstance(response_str,str):
-                        pred = response.choices[0].message.content.split('<answer>')[-1].split('</answer>')[0].strip()
+                    if isinstance(response_str, str):
+                        pred = response_str.split("<answer>")[-1].split("</answer>")[0].strip()
                     else:
-                        pred = ''
+                        pred = ""
 
-                # Expert call done (exclude evaluator).
-                arguments["_expert_ms"] = (time.perf_counter() - expert_t0) * 1000.0
-                
-                if pred.strip()=='' or len(pred.split(' '))>500:
+                else:
+                    arguments["_expert_ms"] = (time.perf_counter() - expert_t0) * 1000.0
+                    arguments["response"] = ""
+                    arguments["pred"] = ""
+                    arguments["correctness"] = False
+                    return arguments
+
+                if pred.strip() == "" or len(pred.split(" ")) > 500:
                     correctness = False
-                elif pred.strip().lower()==arguments['answer'].strip().lower():
+                elif pred.strip().lower() == arguments["answer"].strip().lower():
                     correctness = True
                 else:
-                    eval_prompt = (f"Question: {arguments['problem']}\n\n"
-                                f"Student answer: {pred}\n\n"
-                                f"Reference answer: {arguments['answer']}\n\n"
-                                "Assume that the reference answer is correct. Output <correct>True</correct> if the student answer matches the reference answer. Output <correct>False</correct> if the student answer does not match the reference answer.")
+                    eval_prompt = (
+                        f"Question: {arguments['problem']}\n\n"
+                        f"Student answer: {pred}\n\n"
+                        f"Reference answer: {arguments['answer']}\n\n"
+                        "Assume that the reference answer is correct. Output <correct>True</correct> if the student answer matches the reference answer. Output <correct>False</correct> if the student answer does not match the reference answer."
+                    )
                     judge_t0 = time.perf_counter()
-                    eval_response = get_llm_response(model='gpt-5',messages=eval_prompt,temperature=1)
+                    eval_response = get_llm_response(model="gpt-5", messages=eval_prompt, temperature=1)
                     judge_ms = (time.perf_counter() - judge_t0) * 1000.0
                     arguments["_judge_ms"] = judge_ms
                     log_user_judge_event("evaluator", model="gpt-5", duration_ms=judge_ms)
-                    eval_result = eval_response.split('<correct>')[-1].split('</correct>')[0]
-                    if eval_result.lower()=='true':
-                        correctness = True
-                    else:
-                        correctness = False
-                arguments['response'] = response_str
-                arguments['pred'] = pred
-                arguments['correctness'] = correctness
+                    eval_result = eval_response.split("<correct>")[-1].split("</correct>")[0]
+                    correctness = eval_result.lower() == "true"
+
+                arguments["response"] = response_str
+                arguments["pred"] = pred
+                arguments["correctness"] = correctness
                 return arguments
 
-            elif arguments['tool']=='search':
+            if arguments["tool"] == "search":
                 contents = []
-                prompt = arguments['context_str'].strip()+'\n\n'
-                prompt += f"Question: {arguments['problem']}\nInstead of directly answering the question, please write a query to search for a piece of relevant and missing information. The query should be a few key words about the information to search or a short sentence. Wrap the query within <query> and </query>."
-                cur_query_writer = arguments['model']
+                prompt = arguments["context_str"].strip() + "\n\n"
+                prompt += (
+                    f"Question: {arguments['problem']}\n"
+                    "Instead of directly answering the question, please write a query to search for a piece of relevant and missing information. "
+                    "The query should be a few key words about the information to search or a short sentence. Wrap the query within <query> and </query>."
+                )
+                cur_query_writer = arguments["model"]
                 query_to_call = None
-                if 'gpt-5' in cur_query_writer.lower():
-                    response = get_llm_response(model=cur_query_writer,messages=prompt,return_raw_response=True,temperature=1,max_length=40000)
-                    if isinstance(response,str) or not response:
-                        query_to_call = arguments['problem']
+
+                if "gpt-5" in cur_query_writer.lower():
+                    response = get_llm_response(
+                        model=cur_query_writer,
+                        messages=prompt,
+                        return_raw_response=True,
+                        temperature=1,
+                        max_length=40000,
+                    )
+                    if isinstance(response, str) or not response:
+                        query_to_call = arguments["problem"]
                     else:
-                        query_to_call = response.choices[0].message.content.split('<query>')[-1].split('</query>')[0]
-                elif 'qwen3' in cur_query_writer.lower():
-                    response = get_llm_response(model=cur_query_writer,messages=prompt,return_raw_response=True,model_type='vllm',max_length=8000,temperature=0.2,model_config=arguments['vllm_model_configs'][cur_query_writer],model_config_path=arguments['vllm_model_configs']['vllm_model_config_path'],model_config_idx=arguments['eid'])
-                    if isinstance(response,str):
-                        query_to_call = arguments['problem']
+                        query_to_call = response.choices[0].message.content.split("<query>")[-1].split("</query>")[0]
+                elif "qwen3" in cur_query_writer.lower():
+                    response = get_llm_response(
+                        model=cur_query_writer,
+                        messages=prompt,
+                        return_raw_response=True,
+                        model_type="vllm",
+                        max_length=8000,
+                        temperature=0.2,
+                        model_config=arguments["vllm_model_configs"][cur_query_writer],
+                        model_config_path=arguments["vllm_model_configs"]["vllm_model_config_path"],
+                        model_config_idx=arguments["eid"],
+                    )
+                    if isinstance(response, str):
+                        query_to_call = arguments["problem"]
                     else:
-                        query_to_call = response.choices[0].message.content.split('<query>')[-1].split('</query>')[0]
-                if query_to_call is None or len(query_to_call)<5:
-                    pass
-                else:
-                    assert len(query_to_call)>5,f"{query_to_call}"
-                    payload = {
-                        "queries": [query_to_call[:390]],
-                        "topk": 50,
-                        "return_scores": True,
-                        "eid": arguments['id']
-                    }
+                        query_to_call = response.choices[0].message.content.split("<query>")[-1].split("</query>")[0]
+
+                if query_to_call is not None and len(query_to_call) >= 5:
+                    payload = {"queries": [query_to_call[:390]], "topk": 50, "return_scores": True, "eid": arguments["id"]}
                     results = None
-                    all_vllm_model_configs = arguments['vllm_model_configs']
-                    search_try_count = 0
+                    all_vllm_model_configs = arguments["vllm_model_configs"]
                     while not results:
-                        search_try_count += 1
                         try:
-                            cur_model_config = random.choice(all_vllm_model_configs['retrieval'])
-                            results = requests.post(f'http://{cur_model_config["ip_addr"]}:{cur_model_config["port"]}/retrieve', json=payload).json()
-                        except Exception as search_error:
+                            cur_model_config = random.choice(all_vllm_model_configs["retrieval"])
+                            results = requests.post(
+                                f'http://{cur_model_config["ip_addr"]}:{cur_model_config["port"]}/retrieve',
+                                json=payload,
+                            ).json()
+                        except Exception:
                             time.sleep(3)
+
                     if results:
+                        # Distinguish local-only retrieval vs Tavily fallback (if enabled on retrieval server).
+                        used_tavily = False
+                        local_hits = 0
+                        tavily_hits = 0
+                        try:
+                            if isinstance(results, list) and results and isinstance(results[0], list):
+                                for rr in results[0]:
+                                    if not isinstance(rr, dict):
+                                        continue
+                                    src = rr.get("source")
+                                    if src == "tavily" or (
+                                        isinstance(rr.get("score"), (int, float)) and float(rr.get("score")) < 0
+                                    ):
+                                        used_tavily = True
+                                        tavily_hits += 1
+                                    elif src == "local":
+                                        local_hits += 1
+                        except Exception:
+                            pass
+                        arguments["_search_backend"] = "tavily_fallback" if used_tavily else "local_only"
+                        arguments["_search_local_hits"] = local_hits
+                        arguments["_search_tavily_hits"] = tavily_hits
+
                         for r in results[0]:
-                            if 'content' in r['document']:
-                                contents.append(r['document']['content'])
-                            elif 'contents' in r['document']:
-                                contents.append(r['document']['contents'])
-                arguments['query'] = query_to_call
-                arguments['search_results_data'] = contents
-                if 'tokenizer' in arguments:
-                    arguments.pop('tokenizer')
+                            if "content" in r["document"]:
+                                contents.append(r["document"]["content"])
+                            elif "contents" in r["document"]:
+                                contents.append(r["document"]["contents"])
+
+                arguments["query"] = query_to_call
+                arguments["search_results_data"] = contents
+                if "tokenizer" in arguments:
+                    arguments.pop("tokenizer")
                 return arguments
+
+            # Unknown tool: mark as error but do not raise.
+            arguments["tool_error"] = f"unknown_tool:{tool_name}"
+            arguments["tool_error_type"] = "unknown_tool"
+            return arguments
+
         except Exception as e:
             # Never raise from tool threads; bubble errors back to run_single so it can mark task complete.
             try:
@@ -398,18 +498,28 @@ def call_tool(arguments):
                 pass
             return arguments
         finally:
-            dur_ms = (time.perf_counter() - t0) * 1000.0
+            dur_ms_total = (time.perf_counter() - t0) * 1000.0
             if tool_name == "answer" and arguments.get("_expert_ms") is not None:
                 log_profile_event(
                     "tool_call",
                     tool=tool_name,
                     model=arguments.get("model"),
                     duration_ms=float(arguments.get("_expert_ms") or 0.0),
-                    duration_total_ms=dur_ms,
+                    duration_total_ms=dur_ms_total,
                     judge_ms=float(arguments.get("_judge_ms") or 0.0) if arguments.get("_judge_ms") is not None else None,
                 )
+            elif tool_name == "search":
+                log_profile_event(
+                    "tool_call",
+                    tool=tool_name,
+                    model=arguments.get("model"),
+                    duration_ms=dur_ms_total,
+                    search_backend=arguments.get("_search_backend"),
+                    search_local_hits=arguments.get("_search_local_hits"),
+                    search_tavily_hits=arguments.get("_search_tavily_hits"),
+                )
             else:
-                log_profile_event("tool_call", tool=tool_name, model=arguments.get("model"), duration_ms=dur_ms)
+                log_profile_event("tool_call", tool=tool_name, model=arguments.get("model"), duration_ms=dur_ms_total)
 
 import asyncio
 import contextlib
@@ -431,11 +541,14 @@ async def run_all(
         # wrap each task so it obeys the semaphore
         async def run_one(idx: int, func: Callable, arg: Any):
             async with sem:
-                if asyncio.iscoroutinefunction(func):
-                    res = await func(arg)
-                else:
-                    res = await loop.run_in_executor(executor, func, arg)
-                return idx, res, None
+                try:
+                    if asyncio.iscoroutinefunction(func):
+                        res = await func(arg)
+                    else:
+                        res = await loop.run_in_executor(executor, func, arg)
+                    return idx, res, None
+                except Exception as e:
+                    return idx, None, e
 
         task_list = list(task_list)
         tasks = [asyncio.create_task(run_one(i, f, a))
@@ -593,14 +706,15 @@ def run_single(e):
             cache_idx += 1
         if isinstance(response,str):
             continue
-        tool_calls = response.choices[0].message.tool_calls
+        tool_calls = response.choices[0].message.tool_calls or []
         cache_tool_calls = []
         for one_tool_call in tool_calls:
             tool_name = one_tool_call.function.name
+            tool_arguments = None
             try:
                 tool_arguments = json.loads(one_tool_call.function.arguments)
-            except:
-                pass
+            except Exception:
+                tool_arguments = None
             cache_tool_calls.append({
                 'tool_name': tool_name,
                 'tool_arguments': tool_arguments
@@ -617,19 +731,24 @@ def run_single(e):
         processed_tools = set()
         for one_tool_call in tool_calls:
             tool_name = one_tool_call.function.name
+            tool_arguments = None
             try:
                 tool_arguments = json.loads(one_tool_call.function.arguments)
-            except:
-                pass
+            except Exception:
+                tool_arguments = None
             if not tool_name in ALL_TOOLS:
                 cur_tool_calls.append(f'350 invalid tool calls {tool_calls}')
                 continue
             func_signature = ALL_TOOLS[tool_name]
+            if not isinstance(tool_arguments, dict):
+                cur_tool_calls.append(f'351 invalid tool call args (not json object) {tool_calls}')
+                continue
             valid_tool_call = True
             for parameter_name,parameter_values in func_signature.items():
                 if (not parameter_name in tool_arguments):
                     valid_tool_call = False
-                if (not tool_arguments[parameter_name] in parameter_values) and parameter_values!='any':
+                    continue
+                if (parameter_values!='any') and (not tool_arguments[parameter_name] in parameter_values):
                     valid_tool_call = False
             if not valid_tool_call:
                 cur_tool_calls.append(f'360 invalid tool calls {tool_calls}')
@@ -873,7 +992,8 @@ if __name__=='__main__':
         raw_example['eid'] = eid
         examples.append([run_single,raw_example])
 
-    tool_call_results = asyncio.run(run_all(examples, concurrency=args.concurrency))
+    # Never abort the whole run on a single task exception.
+    tool_call_results = asyncio.run(run_all(examples, concurrency=args.concurrency, return_exceptions=True))
 
 
     
