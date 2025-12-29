@@ -58,13 +58,26 @@ pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
 pip install vllm==0.10.1 transformers
 
 # vLLM 0.10.1+ 需要 hf_transfer 加速下载
-pip install hf_transfer
+pip install hf_transfer matplotlib
 
 # 安装 tau2-bench
 cd evaluation/tau2-bench && pip install -e .
 ```
 
 **注意**: transformers==4.57.3 + vLLM==0.10.1 已在 Blackwell GPU 上验证通过。
+
+#### Plan C on H100 cluster
+
+```bash
+conda create -n vllm1 python=3.12 -y
+conda activate vllm1
+
+pip install vllm==0.12.0 --extra-index-url https://wheels.vllm.ai/0.12.0/cu129 --extra-index-url https://download.pytorch.org/whl/cu129
+
+pip install transformers hf_transfer matplotlib
+
+cd evaluation/tau2-bench && pip install -e .
+```
 
 ### 3. 环境变量配置
 

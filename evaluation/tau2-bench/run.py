@@ -25,8 +25,7 @@ def log(msg):
 SERVE_REPEAT = 1
 serve_script = """#!/bin/bash
 
-#SBATCH --account nvr_lpr_llm
-#SBATCH --partition interactive
+#SBATCH --partition batch
 #SBATCH --time 04:00:00
 #SBATCH --nodes 1
 #SBATCH --gpus-per-node=8
@@ -43,26 +42,32 @@ set -x
 
 hostname -i
 source ~/.bashrc
-source /lustre/fsw/portfolios/llmservice/users/sdiao/anaconda3/bin/activate vllm1
-echo SHIZHE DEBUG HF_HOME: $HF_HOME
-echo SHIZHE DEBUG USER_PATH: $USER_PATH
-export VLLM_CACHE_ROOT="$USER_PATH/cache/vllm/EXPERIMENT_NAME_20"
+conda activate vllm1
+echo "HF_HOME: $HF_HOME"
+echo "USER_PATH: $USER_PATH"
+echo "CKPT_DIR: $CKPT_DIR"
+
+# Set cache directories (use HOME if USER_PATH not set)
+CACHE_BASE="${USER_PATH:-$HOME}/cache/vllm"
+mkdir -p "$CACHE_BASE"
+
+export VLLM_CACHE_ROOT="$CACHE_BASE/EXPERIMENT_NAME_20"
 CUDA_VISIBLE_DEVICES=0 vllm serve CHECKPOINT_DIR --enable-auto-tool-choice --tool-call-parser hermes --port 1900 &
 sleep 60
-export VLLM_CACHE_ROOT="$USER_PATH/cache/vllm/EXPERIMENT_NAME_21"
+export VLLM_CACHE_ROOT="$CACHE_BASE/EXPERIMENT_NAME_21"
 CUDA_VISIBLE_DEVICES=1 vllm serve CHECKPOINT_DIR --enable-auto-tool-choice --tool-call-parser hermes --port 1901 &
 sleep 60
-export VLLM_CACHE_ROOT="$USER_PATH/cache/vllm/EXPERIMENT_NAME_22"
+export VLLM_CACHE_ROOT="$CACHE_BASE/EXPERIMENT_NAME_22"
 CUDA_VISIBLE_DEVICES=2 vllm serve CHECKPOINT_DIR --enable-auto-tool-choice --tool-call-parser hermes --port 1902 &
 sleep 60
-export VLLM_CACHE_ROOT="$USER_PATH/cache/vllm/EXPERIMENT_NAME_23"
+export VLLM_CACHE_ROOT="$CACHE_BASE/EXPERIMENT_NAME_23"
 CUDA_VISIBLE_DEVICES=3 vllm serve CHECKPOINT_DIR --enable-auto-tool-choice --tool-call-parser hermes --port 1903 &
 sleep 60
-export VLLM_CACHE_ROOT="$USER_PATH/cache/vllm/EXPERIMENT_NAME_24"
+export VLLM_CACHE_ROOT="$CACHE_BASE/EXPERIMENT_NAME_24"
 CUDA_VISIBLE_DEVICES=4,5 vllm serve Qwen/Qwen3-32B --enable-auto-tool-choice --tool-call-parser hermes --port 1904 --tensor-parallel-size 2 &
 sleep 60
-export VLLM_CACHE_ROOT="$USER_PATH/cache/vllm/EXPERIMENT_NAME_25"
-CUDA_VISIBLE_DEVICES=6,7 vllm serve Qwen/Qwen3-32B --enable-auto-tool-choice --tool-call-parser hermes --port 1905 --tensor-parallel-size 2  &
+export VLLM_CACHE_ROOT="$CACHE_BASE/EXPERIMENT_NAME_25"
+CUDA_VISIBLE_DEVICES=6,7 vllm serve Qwen/Qwen3-32B --enable-auto-tool-choice --tool-call-parser hermes --port 1905 --tensor-parallel-size 2 &
 sleep 15000"""
 
 def get_jobs():

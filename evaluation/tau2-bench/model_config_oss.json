@@ -1,0 +1,29 @@
+{
+  "/home/junxiong/haokang/ckpt/nvidia/Nemotron-Orchestrator-8B/": [
+    {"ip_addr": "research-secure-12", "port": "1900"},
+    {"ip_addr": "research-secure-12", "port": "1901"},
+    {"ip_addr": "research-secure-12", "port": "1902"},
+    {"ip_addr": "research-secure-12", "port": "1903"}
+  ],
+  "Qwen/Qwen3-Next-80B-A3B-Instruct": [
+    {"ip_addr": "research-secure-11", "port": "1904"}
+  ],
+  "openai/gpt-oss-120b": [
+    {"ip_addr": "research-secure-05", "port": "1910"},
+    {"ip_addr": "research-secure-05", "port": "1911"},
+    {"ip_addr": "research-secure-05", "port": "1912"},
+    {"ip_addr": "research-secure-05", "port": "1913"}
+  ],
+  "openai/gpt-oss-20b": [
+    {"ip_addr": "research-secure-13", "port": "1914"},
+    {"ip_addr": "research-secure-13", "port": "1915"},
+    {"ip_addr": "research-secure-13", "port": "1916"},
+    {"ip_addr": "research-secure-13", "port": "1917"}
+  ],
+  "vllm_model_config_path": "model_config_oss.json",
+  "oss_expert_mapping": {
+    "expert-1": "openai/gpt-oss-120b",
+    "expert-2": "openai/gpt-oss-20b",
+    "expert-3": "Qwen/Qwen3-Next-80B-A3B-Instruct"
+  }
+}

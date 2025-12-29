@@ -93,6 +93,19 @@ TOOL_PRICING = {
         "input_tokens_per_million": 3/1000000,
         "output_tokens_per_million": 15/1000000
     },
+    # OSS Expert Models (speculative decoding enabled)
+    "openai/gpt-oss-120b": {
+        "input_tokens_per_million": 0.6/1000000,  # Estimated OSS pricing
+        "output_tokens_per_million": 0.6/1000000
+    },
+    "openai/gpt-oss-20b": {
+        "input_tokens_per_million": 0.2/1000000,
+        "output_tokens_per_million": 0.2/1000000
+    },
+    "Qwen/Qwen3-Next-80B-A3B-Instruct": {
+        "input_tokens_per_million": 0.5/1000000,
+        "output_tokens_per_million": 0.5/1000000
+    },
     "code_interpreter_per_second": 0.0000083,
     "tavily": {
         "search": 0.01,
@@ -555,12 +568,28 @@ def generate(
                 one_tool_call_arguments = json.loads(one_tool_call.function.arguments)
                 if one_tool_call.function.name=='call_expert':
                     if 'expert' in one_tool_call_arguments:
-                        if one_tool_call_arguments['expert']=='expert-1':
-                            mode_to_call = 'gpt-5'
-                        elif one_tool_call_arguments['expert']=='expert-2':
-                            mode_to_call = 'gpt-5-mini'
-                        elif one_tool_call_arguments['expert']=='expert-3':
-                            mode_to_call = 'Qwen/Qwen3-32B'
+                        # Check if OSS expert mapping is configured in model_config
+                        oss_mapping = None
+                        if model_config_path:
+                            try:
+                                with open(model_config_path) as f:
+                                    cfg = json.load(f)
+                                oss_mapping = cfg.get('oss_expert_mapping', None)
+                            except Exception:
+                                pass
+
+                        expert_choice = one_tool_call_arguments['expert']
+                        if oss_mapping and expert_choice in oss_mapping:
+                            # Use OSS model mapping
+                            mode_to_call = oss_mapping[expert_choice]
+                        else:
+                            # Default proprietary model mapping
+                            if expert_choice == 'expert-1':
+                                mode_to_call = 'gpt-5'
+                            elif expert_choice == 'expert-2':
+                                mode_to_call = 'gpt-5-mini'
+                            elif expert_choice == 'expert-3':
+                                mode_to_call = 'Qwen/Qwen3-32B'
                 tool_calls.append({
                         'name': one_tool_call.function.name,
                         'arguments': one_tool_call_arguments
@@ -572,10 +601,17 @@ def generate(
             expert_timer.__enter__()
             
             llm_messages = to_litellm_messages(messages,model=mode_to_call,use_model_tool=False,domain=domain,role=role)
-            expert_call_type = "openai" if 'gpt-5' in mode_to_call else "vllm"
-            if 'gpt-5' in mode_to_call:
+
+            # Determine expert call type based on model
+            is_openai_api = 'gpt-5' in mode_to_call and 'gpt-oss' not in mode_to_call.lower()
+            is_vllm_oss = 'gpt-oss' in mode_to_call.lower() or 'qwen3' in mode_to_call.lower()
+            expert_call_type = "openai" if is_openai_api else "vllm"
+
+            if is_openai_api:
+                # Proprietary OpenAI models (gpt-5, gpt-5-mini)
                 response = get_llm_response(model=mode_to_call,messages=llm_messages,tools=original_tools,return_raw_response=True,max_length=40000)
-            elif 'qwen3' in mode_to_call.lower():
+            elif is_vllm_oss:
+                # OSS models via local vLLM (gpt-oss-*, qwen3-*, qwen3-next-*)
                 with open(model_config_path) as f:
                     model_config = json.load(f)[mode_to_call]
                 tools_length = len(tokenizer(str(original_tools))['input_ids'])
