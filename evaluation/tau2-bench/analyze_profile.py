@@ -166,7 +166,7 @@ def parse_profile_logs(log_path: str) -> Dict[str, Any]:
 
 
 def compute_stats(values: List[float]) -> Dict[str, Any]:
-    """Compute enhanced statistics including p10, p25, p40 and <5s%."""
+    """Compute enhanced statistics with full percentile range and <5s%."""
     if not values:
         return {"count": 0}
 
@@ -180,9 +180,14 @@ def compute_stats(values: List[float]) -> Dict[str, Any]:
         "min": float(np.min(arr)),
         "max": float(np.max(arr)),
         "p10": float(np.percentile(arr, 10)),
+        "p20": float(np.percentile(arr, 20)),
         "p25": float(np.percentile(arr, 25)),
+        "p30": float(np.percentile(arr, 30)),
         "p40": float(np.percentile(arr, 40)),
         "p50": float(np.percentile(arr, 50)),
+        "p60": float(np.percentile(arr, 60)),
+        "p70": float(np.percentile(arr, 70)),
+        "p80": float(np.percentile(arr, 80)),
         "p90": float(np.percentile(arr, 90)),
         "p95": float(np.percentile(arr, 95)),
         "p99": float(np.percentile(arr, 99)),
