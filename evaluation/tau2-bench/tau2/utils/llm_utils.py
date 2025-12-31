@@ -93,7 +93,7 @@ TOOL_PRICING = {
         "input_tokens_per_million": 3/1000000,
         "output_tokens_per_million": 15/1000000
     },
-    # OSS Expert Models (speculative decoding enabled)
+    # OSS Expert Models
     "openai/gpt-oss-120b": {
         "input_tokens_per_million": 0.6/1000000,  # Estimated OSS pricing
         "output_tokens_per_million": 0.6/1000000
@@ -103,6 +103,14 @@ TOOL_PRICING = {
         "output_tokens_per_million": 0.2/1000000
     },
     "Qwen/Qwen3-Next-80B-A3B-Instruct": {
+        "input_tokens_per_million": 0.5/1000000,
+        "output_tokens_per_million": 0.5/1000000
+    },
+    "Qwen/Qwen3-32B-FP8": {
+        "input_tokens_per_million": 0.8/1000000,
+        "output_tokens_per_million": 0.8/1000000
+    },
+    "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8": {
         "input_tokens_per_million": 0.5/1000000,
         "output_tokens_per_million": 0.5/1000000
     },
@@ -358,14 +366,23 @@ def to_tau2_messages(
     return tau2_messages
 
 
-def to_litellm_messages(messages: list[Message],model,use_model_tool,domain,role) -> list[dict]:
+def to_litellm_messages(messages: list[Message],model,use_model_tool,domain,role,enable_thinking=True) -> list[dict]:
     """
     Convert a list of Tau2 messages to a list of litellm messages.
+
+    Args:
+        enable_thinking: If False, disable thinking mode for Qwen3 models by adding /no_think.
+                        This is used for expert models to get direct responses without CoT.
     """
     litellm_messages = []
     for message in messages:
         if isinstance(message, UserMessage):
-            litellm_messages.append({"role": "user", "content": message.content})
+            content = message.content
+            # For Qwen3 models with thinking disabled, append /no_think to user messages
+            # Per Qwen3 documentation: https://huggingface.co/Qwen/Qwen3-32B
+            if not enable_thinking and 'qwen3' in model.lower():
+                content = content + " /no_think"
+            litellm_messages.append({"role": "user", "content": content})
         elif isinstance(message, AssistantMessage):
             tool_calls = None
             if message.is_tool_call():
@@ -402,7 +419,12 @@ def to_litellm_messages(messages: list[Message],model,use_model_tool,domain,role
                 if use_model_tool:
                     for s in POLICY_STRINGS:
                         cur_content = cur_content.replace(s,EXPERT_POLICT)
-                litellm_messages.append({"role": "system", "content": cur_content+'  You are dedicated to provide the best service. Wrap thinking process between <think> </think>, message between <message> </message> and the tool call between <tool_call> </tool_call> .'})
+                # Only add thinking instructions if enable_thinking is True
+                if enable_thinking:
+                    litellm_messages.append({"role": "system", "content": cur_content+'  You are dedicated to provide the best service. Wrap thinking process between <think> </think>, message between <message> </message> and the tool call between <tool_call> </tool_call> .'})
+                else:
+                    # For expert Qwen3 models, keep output format but no thinking
+                    litellm_messages.append({"role": "system", "content": cur_content+'  You are dedicated to provide the best service. Wrap message between <message> </message> and the tool call between <tool_call> </tool_call> .'})
             else:
                 litellm_messages.append({"role": "system", "content": message.content})
     if role=='assistant' and 'gpt-5' in model.lower():
@@ -599,8 +621,17 @@ def generate(
             # Time the expert call separately
             expert_timer = Timer()
             expert_timer.__enter__()
-            
-            llm_messages = to_litellm_messages(messages,model=mode_to_call,use_model_tool=False,domain=domain,role=role)
+
+            # Expert profiling variables
+            expert_prefill_ms: Optional[float] = None
+            expert_decode_ms: Optional[float] = None
+            expert_prefill_len: Optional[int] = None
+            expert_decode_len: Optional[int] = None
+
+            # For Qwen3 expert models, disable thinking mode to get direct responses
+            # Per Qwen3 documentation: use /no_think to disable CoT
+            expert_enable_thinking = not ('qwen3' in mode_to_call.lower())
+            llm_messages = to_litellm_messages(messages,model=mode_to_call,use_model_tool=False,domain=domain,role=role,enable_thinking=expert_enable_thinking)
 
             # Determine expert call type based on model
             is_openai_api = 'gpt-5' in mode_to_call and 'gpt-oss' not in mode_to_call.lower()
@@ -612,22 +643,45 @@ def generate(
                 response = get_llm_response(model=mode_to_call,messages=llm_messages,tools=original_tools,return_raw_response=True,max_length=40000)
             elif is_vllm_oss:
                 # OSS models via local vLLM (gpt-oss-*, qwen3-*, qwen3-next-*)
+                # Enable streaming profiling to capture prefill/decode times
+                expert_stream_profile = tau2_logger.isEnabledFor(PROFILE)
                 with open(model_config_path) as f:
                     model_config = json.load(f)[mode_to_call]
                 tools_length = len(tokenizer(str(original_tools))['input_ids'])
                 cut_messages = cut_middle_turns(tokenizer=tokenizer,messages=litellm_messages,max_length=23000-tools_length)
-                response = get_llm_response(model=mode_to_call,messages=cut_messages,tools=original_tools,return_raw_response=True,model_config=model_config,model_config_path=model_config_path,model_config_idx=config_idx,model_type='vllm',max_length=8000)
+                response = get_llm_response(
+                    model=mode_to_call,
+                    messages=cut_messages,
+                    tools=original_tools,
+                    return_raw_response=True,
+                    model_config=model_config,
+                    model_config_path=model_config_path,
+                    model_config_idx=config_idx,
+                    model_type='vllm',
+                    max_length=8000,
+                    tau2_stream_profile=expert_stream_profile,
+                )
+                # Extract streaming profiling data if available
+                if not isinstance(response, str):
+                    expert_prefill_ms = getattr(response, "tau2_vllm_prefill_ms", None)
+                    expert_decode_ms = getattr(response, "tau2_vllm_decode_ms", None)
+                    expert_prefill_len = getattr(response, "tau2_vllm_prompt_tokens", None)
+                    expert_decode_len = getattr(response, "tau2_vllm_completion_tokens", None)
             else:
                 raise ValueError(f'Model {mode_to_call} is not supported')
-            
+
             expert_timer.__exit__(None, None, None)
-            
-            # Log expert call
+
+            # Log expert call with prefill/decode breakdown for vLLM models
             log_profile_event(
                 "expert_call",
                 model=mode_to_call,
                 call_type=expert_call_type,
                 duration_ms=expert_timer.duration_ms,
+                prefill_ms=expert_prefill_ms,
+                decode_ms=expert_decode_ms,
+                input_tokens=expert_prefill_len,
+                output_tokens=expert_decode_len,
             )
             
             if isinstance(response,str):
@@ -751,11 +805,11 @@ def generate(
             model=model,
             call_type=call_type,
             duration_ms=llm_timer.duration_ms,
-            toolorchestra_vllm_infer_ms=toolorchestra_vllm_infer_ms,
-            toolorchestra_vllm_prefill_ms=toolorchestra_vllm_prefill_ms,
-            toolorchestra_vllm_decode_ms=toolorchestra_vllm_decode_ms,
-            toolorchestra_vllm_prefill_len=toolorchestra_vllm_prefill_len,
-            toolorchestra_vllm_decode_len=toolorchestra_vllm_decode_len,
+            vllm_infer_ms=toolorchestra_vllm_infer_ms,
+            prefill_ms=toolorchestra_vllm_prefill_ms,
+            decode_ms=toolorchestra_vllm_decode_ms,
+            input_tokens=toolorchestra_vllm_prefill_len,
+            output_tokens=toolorchestra_vllm_decode_len,
             has_tool_calls=bool(tool_calls),
         )
     elif role in ('user', 'evaluator'):

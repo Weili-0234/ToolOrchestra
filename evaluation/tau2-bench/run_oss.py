@@ -34,59 +34,64 @@ def log(msg: str):
 
 # Expert model mappings (OSS replacements for proprietary models)
 OSS_EXPERT_MAPPING = {
-    "expert-1": "openai/gpt-oss-120b",      # replaces gpt-5
-    "expert-2": "openai/gpt-oss-20b",       # replaces gpt-5-mini
-    "expert-3": "Qwen/Qwen3-Next-80B-A3B-Instruct",  # replaces Qwen/Qwen3-32B
+    "expert-1": "openai/gpt-oss-20b",       # replaces gpt-5 (no speculator, TP=1, DP=4)
+    "expert-2": "Qwen/Qwen3-32B-FP8",       # replaces gpt-5-mini (non-thinking mode, TP=1, DP=4)
+    "expert-3": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",  # replaces Qwen/Qwen3-32B (MTP 4 tokens, TP=2, DP=4)
 }
+
+# Chat template for Orchestrator-8B (Llama 3.1 style tool calling)
+# This template uses Llama 3.1 format with JSON tool calls:
+#   - <|start_header_id|>system<|end_header_id|> for system messages
+#   - <|start_header_id|>user<|end_header_id|> for user messages
+#   - <|start_header_id|>assistant<|end_header_id|> for assistant messages
+#   - <|start_header_id|>ipython<|end_header_id|> for tool responses
+#   - Tool calls: {"name": "function_name", "parameters": {...}}
+# Using this template prevents the "unexpected tokens remaining in message header" error
+# that occurs when the model outputs internal commentary channel tokens.
+ORCHESTRATOR_CHAT_TEMPLATE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "tool_chat_template_llama3.1_json.jinja"
+)
 
 # Model deployment specifications
 MODEL_SPECS = {
-    "openai/gpt-oss-120b": {
-        "tensor_parallel_size": 4,  # TP4 for lower latency on 120B
-        "speculative_config": json.dumps({
-            "model": "nvidia/gpt-oss-120b-Eagle3-v2",
-            "num_speculative_tokens": 3,
-            "method": "eagle3",
-            "draft_tensor_parallel_size": 1
-        }),
-        "extra_args": [
-            "--async-scheduling",
-            "--no-enable-prefix-caching",
-            "--max-cudagraph-capture-size", "2048",
-            "--max-num-batched-tokens", "8192",
-            "--stream-interval", "20",
-        ],
-        "gpu_memory_utilization": 0.95,
-        "num_instances": 1,  # One instance with TP4
-    },
+    # expert-1: gpt-oss-20b (no speculator, TP=1, DP=4)
     "openai/gpt-oss-20b": {
-        "tensor_parallel_size": 1,  # TP1, small enough for single GPU
-        "speculative_config": json.dumps({
-            "model": "RedHatAI/gpt-oss-20b-speculator.eagle3",
-            "num_speculative_tokens": 3,
-            "method": "eagle3"
-        }),
+        "tensor_parallel_size": 1,  # TP1, single GPU per instance
+        "speculative_config": None,  # No EAGLE3 speculator
         "extra_args": [
             "--async-scheduling",
-            "--no-enable-prefix-caching",
         ],
         "gpu_memory_utilization": 0.95,
         "num_instances": 4,  # 4 DP instances for high throughput
     },
-    "Qwen/Qwen3-Next-80B-A3B-Instruct": {
-        "tensor_parallel_size": 4,  # TP4 required for 80B
+    # expert-2: Qwen3-32B-FP8 (no MTP, TP=1, DP=4)
+    # Note: --chat-template-kwargs not supported in vLLM 0.12.0
+    # Thinking mode is controlled via system prompt or model config
+    "Qwen/Qwen3-32B-FP8": {
+        "tensor_parallel_size": 1,  # TP1, single GPU per instance
+        "speculative_config": None,  # Qwen3 doesn't support MTP
+        "extra_args": [],  # No extra args needed
+        "gpu_memory_utilization": 0.95,
+        "num_instances": 4,  # 4 DP instances
+    },
+    # expert-3: Qwen3-Next-80B-A3B-Instruct-FP8 (MTP 4 tokens, TP=2, DP=4)
+    # Note: Reduced gpu_memory_utilization to 0.88 to avoid OOM with MTP
+    "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8": {
+        "tensor_parallel_size": 2,  # TP2 for 80B FP8
         "speculative_config": json.dumps({
             "method": "qwen3_next_mtp",
-            "num_speculative_tokens": 2
+            "num_speculative_tokens": 4  # Increased from 2 to 4
         }),
         "extra_args": [
             "--tokenizer-mode", "auto",
             "--no-enable-chunked-prefill",
+            "--no-enable-prefix-caching",
             "--compilation_config.pass_config.enable_fi_allreduce_fusion", "true",
             "--compilation_config.pass_config.enable_noop", "true",
         ],
-        "gpu_memory_utilization": 0.95,
-        "num_instances": 1,  # One instance with TP4
+        "gpu_memory_utilization": 0.88,  # Reduced from 0.95 to avoid OOM with MTP
+        "num_instances": 4,  # 4 DP instances with TP2 each
     },
 }
 
@@ -97,7 +102,7 @@ MODEL_SPECS = {
 SLURM_HEADER = """#!/bin/bash
 
 #SBATCH --partition batch
-#SBATCH --time 04:00:00
+#SBATCH --time 24:00:00
 #SBATCH --nodes 1
 #SBATCH --gpus-per-node={gpus}
 #SBATCH --job-name {job_name}
@@ -131,24 +136,69 @@ echo "Node: $(hostname)"
 CACHE_BASE="${{USER_PATH:-$HOME}}/cache/vllm"
 mkdir -p "$CACHE_BASE"
 
-# Check GPU status before launching vLLM servers
+# ===========================================================================
+# GPU Cleanup Check: Verify node is clean before launching vLLM servers
+# ===========================================================================
+# IMPORTANT: sbatch may allocate nodes that appear idle in SLURM but actually
+# have running processes. This check ensures the node is clean before we start.
 echo "=== GPU Status at Job Start ==="
 nvidia-smi --query-gpu=index,name,memory.used,memory.free,memory.total --format=csv
 echo "=== End GPU Status ==="
+
+# Check for any existing GPU processes
+echo "=== Checking for existing GPU processes ==="
+GPU_PROCESSES=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null | wc -l)
+if [ "$GPU_PROCESSES" -gt 0 ]; then
+    echo "WARNING: Found $GPU_PROCESSES existing GPU processes!"
+    nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+    echo ""
+    echo "=== Attempting to kill stale processes ==="
+    # Kill any GPU processes not owned by us (with timeout)
+    nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | while read pid; do
+        if [ -n "$pid" ]; then
+            PROC_USER=$(ps -o user= -p $pid 2>/dev/null | tr -d ' ')
+            if [ "$PROC_USER" = "$USER" ]; then
+                echo "Killing our own stale process: PID=$pid"
+                kill -9 $pid 2>/dev/null || true
+            else
+                echo "WARNING: Found process owned by $PROC_USER (PID=$pid) - cannot kill"
+            fi
+        fi
+    done
+    sleep 5
+    # Re-check after cleanup
+    GPU_PROCESSES_AFTER=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l)
+    if [ "$GPU_PROCESSES_AFTER" -gt 0 ]; then
+        echo "ERROR: Still have $GPU_PROCESSES_AFTER GPU processes after cleanup. Node may be occupied."
+        nvidia-smi
+        # Continue anyway but log the warning - let the user decide
+    else
+        echo "GPU cleanup successful - all GPUs are now free"
+    fi
+else
+    echo "All GPUs are clean - no existing processes found"
+fi
+echo "=== End GPU Cleanup Check ==="
 """
 
 def generate_agent_script(job_name: str, ckpt_dir: str, num_instances: int = 4, start_port: int = 1900) -> str:
-    """Generate SLURM script for agent (Orchestrator-8B) servers"""
+    """Generate SLURM script for agent (Orchestrator-8B) servers.
+
+    Uses the Llama 3.1 chat template (tool_chat_template_llama3.1_json.jinja) for proper
+    tool call parsing. This template uses JSON format for tool calls and prevents the
+    "unexpected tokens remaining in message header" error that occurs with the default template.
+    """
     script = SLURM_HEADER.format(gpus=8, job_name=job_name)
 
     for i in range(num_instances):
         port = start_port + i
         script += f"""
-# Agent server {i+1}
+# Agent server {i+1} (Orchestrator-8B with Llama 3.1 chat template)
 export VLLM_CACHE_ROOT="$CACHE_BASE/{job_name}_agent_{i}"
 CUDA_VISIBLE_DEVICES={i} vllm serve {ckpt_dir} \\
     --enable-auto-tool-choice \\
     --tool-call-parser hermes \\
+    --chat-template {ORCHESTRATOR_CHAT_TEMPLATE} \\
     --port {port} &
 sleep 30
 """
@@ -183,12 +233,30 @@ vllm serve {model_name} \\
     --port {start_port} \\
     --tensor-parallel-size {tp_size} \\
     --gpu-memory-utilization {spec['gpu_memory_utilization']} \\
-    --speculative-config '{spec['speculative_config']}' \\
 """
 
-    # Add extra args
-    for arg in spec.get("extra_args", []):
-        cmd += f"    {arg} \\\n"
+    # Add speculative config only if it's defined
+    if spec.get('speculative_config') is not None:
+        cmd += f"    --speculative-config '{spec['speculative_config']}' \\\n"
+
+    # Add extra args (keep flag and value together on same line)
+    extra_args = spec.get("extra_args", [])
+    i = 0
+    while i < len(extra_args):
+        arg = extra_args[i]
+        # Check if this is a flag that needs its value on the same line
+        if arg.startswith("--") and i + 1 < len(extra_args) and not extra_args[i + 1].startswith("--"):
+            # This is a flag followed by a value - keep them together
+            value = extra_args[i + 1]
+            # Properly quote JSON values for shell
+            if value.startswith("{") or value.startswith("'"):
+                cmd += f"    {arg} '{value}' \\\n"
+            else:
+                cmd += f"    {arg} {value} \\\n"
+            i += 2
+        else:
+            cmd += f"    {arg} \\\n"
+            i += 1
 
     cmd += "    &\nsleep 60\n"
     return cmd
@@ -196,13 +264,14 @@ vllm serve {model_name} \\
 
 def generate_node1_script(job_name: str, ckpt_dir: str) -> str:
     """
-    Generate SLURM script for Node 1 (Agent + Expert-3):
-    - GPU 0-3: Orchestrator-8B (4 DP instances)
-    - GPU 4-7: Qwen3-Next-80B-A3B-Instruct (TP4)
+    Generate SLURM script for Node 1 (Agent + Expert-2):
+    - GPU 0-3: Orchestrator-8B (4 DP instances, ports 1900-1903)
+    - GPU 4-7: Qwen3-32B-FP8 (expert-2, TP1 × DP4, ports 1904-1907)
     """
     script = SLURM_HEADER.format(gpus=8, job_name=job_name)
 
     # Agent servers (GPU 0-3, ports 1900-1903) - 4 DP instances
+    # Uses Llama 3.1 chat template for proper tool call parsing
     for i in range(4):
         script += f"""
 # Agent server {i+1} (Orchestrator-8B)
@@ -211,19 +280,21 @@ export CUDA_VISIBLE_DEVICES={i}
 vllm serve {ckpt_dir} \\
     --enable-auto-tool-choice \\
     --tool-call-parser hermes \\
+    --chat-template {ORCHESTRATOR_CHAT_TEMPLATE} \\
     --port {1900 + i} \\
     --gpu-memory-utilization 0.95 &
 sleep 30
 """
 
-    # Qwen3-Next-80B (GPU 4-7, TP4, port 1904)
-    script += generate_expert_script(
-        job_name=job_name,
-        model_name="Qwen/Qwen3-Next-80B-A3B-Instruct",
-        start_gpu=4,
-        start_port=1904,
-        instance_id=0
-    )
+    # Expert-2: Qwen3-32B-FP8 (GPU 4-7, TP1 × DP4, ports 1904-1907)
+    for i in range(4):
+        script += generate_expert_script(
+            job_name=job_name,
+            model_name="Qwen/Qwen3-32B-FP8",
+            start_gpu=4 + i,
+            start_port=1904 + i,
+            instance_id=i
+        )
 
     script += "\n# Keep job running\nsleep 15000\n"
     return script
@@ -231,28 +302,41 @@ sleep 30
 
 def generate_node2_script(job_name: str) -> str:
     """
-    Generate SLURM script for Node 2 (Expert-1 + Expert-2):
-    - GPU 0-3: GPT-OSS-120B (TP4)
-    - GPU 4-7: GPT-OSS-20B (4 DP instances)
+    Generate SLURM script for Node 2 (Expert-1):
+    - GPU 0-3: gpt-oss-20b (expert-1, TP1 × DP4, ports 1910-1913)
+    - GPU 4-7: (unused)
     """
     script = SLURM_HEADER.format(gpus=8, job_name=job_name)
 
-    # GPT-OSS-120B (GPU 0-3, TP4, port 1910)
-    script += generate_expert_script(
-        job_name=job_name,
-        model_name="openai/gpt-oss-120b",
-        start_gpu=0,
-        start_port=1910,
-        instance_id=0
-    )
-
-    # GPT-OSS-20B (GPU 4-7, 4 DP instances, ports 1914-1917)
+    # Expert-1: gpt-oss-20b (GPU 0-3, TP1 × DP4, ports 1910-1913)
     for i in range(4):
         script += generate_expert_script(
             job_name=job_name,
             model_name="openai/gpt-oss-20b",
-            start_gpu=4 + i,
-            start_port=1914 + i,
+            start_gpu=i,
+            start_port=1910 + i,
+            instance_id=i
+        )
+
+    script += "\n# Keep job running\nsleep 15000\n"
+    return script
+
+
+def generate_node3_script(job_name: str) -> str:
+    """
+    Generate SLURM script for Node 3 (Expert-3):
+    - GPU 0-7: Qwen3-Next-80B-A3B-Instruct-FP8 (expert-3, TP2 × DP4, ports 1920-1923)
+    """
+    script = SLURM_HEADER.format(gpus=8, job_name=job_name)
+
+    # Expert-3: Qwen3-Next-80B-FP8 (TP2 × DP4)
+    # Each instance uses 2 GPUs (TP2), 4 instances total
+    for i in range(4):
+        script += generate_expert_script(
+            job_name=job_name,
+            model_name="Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
+            start_gpu=i * 2,  # GPU 0-1, 2-3, 4-5, 6-7
+            start_port=1920 + i,
             instance_id=i
         )
 
@@ -351,14 +435,16 @@ def cancel_job(job_id: str):
 def generate_model_config(
     node1_ip: str,
     node2_ip: str,
+    node3_ip: str,
     ckpt_dir: str,
     output_path: str = "model_config_oss.json"
 ) -> Dict:
     """
     Generate model configuration for tau2-bench with OSS models.
 
-    Node 1: Agent (ports 1900-1903) + Qwen3-Next-80B (port 1904)
-    Node 2: GPT-OSS-120B (port 1910) + GPT-OSS-20B (ports 1914-1917)
+    Node 1: Agent (ports 1900-1903) + Qwen3-32B-FP8 (expert-2, ports 1904-1907)
+    Node 2: gpt-oss-20b (expert-1, ports 1910-1913)
+    Node 3: Qwen3-Next-80B-FP8 (expert-3, ports 1920-1923)
     """
 
     config = {
@@ -369,20 +455,26 @@ def generate_model_config(
             {"ip_addr": node1_ip, "port": "1902"},
             {"ip_addr": node1_ip, "port": "1903"},
         ],
-        # Expert-3: Qwen3-Next-80B - Node 1, GPU 4-7 (TP4)
-        "Qwen/Qwen3-Next-80B-A3B-Instruct": [
+        # Expert-2: Qwen3-32B-FP8 - Node 1, GPU 4-7 (TP1 × DP4)
+        "Qwen/Qwen3-32B-FP8": [
             {"ip_addr": node1_ip, "port": "1904"},
+            {"ip_addr": node1_ip, "port": "1905"},
+            {"ip_addr": node1_ip, "port": "1906"},
+            {"ip_addr": node1_ip, "port": "1907"},
         ],
-        # Expert-1: GPT-OSS-120B - Node 2, GPU 0-3 (TP4)
-        "openai/gpt-oss-120b": [
-            {"ip_addr": node2_ip, "port": "1910"},
-        ],
-        # Expert-2: GPT-OSS-20B - Node 2, GPU 4-7 (4 DP instances)
+        # Expert-1: gpt-oss-20b - Node 2, GPU 0-3 (TP1 × DP4)
         "openai/gpt-oss-20b": [
-            {"ip_addr": node2_ip, "port": "1914"},
-            {"ip_addr": node2_ip, "port": "1915"},
-            {"ip_addr": node2_ip, "port": "1916"},
-            {"ip_addr": node2_ip, "port": "1917"},
+            {"ip_addr": node2_ip, "port": "1910"},
+            {"ip_addr": node2_ip, "port": "1911"},
+            {"ip_addr": node2_ip, "port": "1912"},
+            {"ip_addr": node2_ip, "port": "1913"},
+        ],
+        # Expert-3: Qwen3-Next-80B-FP8 - Node 3, GPU 0-7 (TP2 × DP4)
+        "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8": [
+            {"ip_addr": node3_ip, "port": "1920"},
+            {"ip_addr": node3_ip, "port": "1921"},
+            {"ip_addr": node3_ip, "port": "1922"},
+            {"ip_addr": node3_ip, "port": "1923"},
         ],
         "vllm_model_config_path": output_path,
         # OSS expert mapping for llm_utils.py
@@ -393,8 +485,9 @@ def generate_model_config(
         json.dump(config, f, indent=2)
 
     log(f"Model configuration written to {output_path}")
-    log(f"  Node 1 ({node1_ip}): Agent (1900-1903), Qwen3-Next-80B (1904)")
-    log(f"  Node 2 ({node2_ip}): GPT-OSS-120B (1910), GPT-OSS-20B (1914-1917)")
+    log(f"  Node 1 ({node1_ip}): Agent (1900-1903), Qwen3-32B-FP8 (1904-1907)")
+    log(f"  Node 2 ({node2_ip}): gpt-oss-20b (1910-1913)")
+    log(f"  Node 3 ({node3_ip}): Qwen3-Next-80B-FP8 (1920-1923)")
     return config
 
 
@@ -577,18 +670,21 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 OSS Expert Model Mapping:
-  expert-1: openai/gpt-oss-120b (EAGLE3 speculative decoding)
-  expert-2: openai/gpt-oss-20b (EAGLE3 speculative decoding)
-  expert-3: Qwen/Qwen3-Next-80B-A3B-Instruct (MTP speculative decoding)
+  expert-1: openai/gpt-oss-20b (no speculator, TP=1, DP=4)
+  expert-2: Qwen/Qwen3-32B-FP8 (non-thinking mode, TP=1, DP=4)
+  expert-3: Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 (MTP 4 tokens, TP=2, DP=4)
 
-GPU Allocation (2 nodes, 16 GPU total):
-  Node 1 (8 GPU) - Agent + Expert-3:
+GPU Allocation (3 nodes, 24 GPU total):
+  Node 1 (8 GPU) - Agent + Expert-2:
     - GPU 0-3: Orchestrator-8B (4 DP instances, ports 1900-1903)
-    - GPU 4-7: Qwen3-Next-80B-A3B (TP4 + MTP, port 1904)
+    - GPU 4-7: Qwen3-32B-FP8 (TP1 × DP4, ports 1904-1907)
 
-  Node 2 (8 GPU) - Expert-1 + Expert-2:
-    - GPU 0-3: GPT-OSS-120B (TP4 + EAGLE3, port 1910)
-    - GPU 4-7: GPT-OSS-20B (4 DP instances + EAGLE3, ports 1914-1917)
+  Node 2 (8 GPU) - Expert-1:
+    - GPU 0-3: gpt-oss-20b (TP1 × DP4, ports 1910-1913)
+    - GPU 4-7: (unused)
+
+  Node 3 (8 GPU) - Expert-3:
+    - GPU 0-7: Qwen3-Next-80B-FP8 (TP2 × DP4, ports 1920-1923)
 
 Example usage:
   python run_oss.py
@@ -721,11 +817,13 @@ Example usage:
 
     node1_ip = None
     node2_ip = None
+    node3_ip = None
 
     if not args.skip_server_start:
         # Generate and submit SLURM jobs
         job1_name = f"{args.job_prefix}_node1"
         job2_name = f"{args.job_prefix}_node2"
+        job3_name = f"{args.job_prefix}_node3"
 
         # Check for existing jobs and cancel if needed
         jobs = get_jobs()
@@ -750,8 +848,14 @@ Example usage:
             f.write(script2)
         log(f"Generated: {script2_path}")
 
+        script3 = generate_node3_script(job3_name)
+        script3_path = f"{job3_name}.sh"
+        with open(script3_path, 'w') as f:
+            f.write(script3)
+        log(f"Generated: {script3_path}")
+
         # Clean up old output files
-        for name in [job1_name, job2_name]:
+        for name in [job1_name, job2_name, job3_name]:
             for ext in ['.out', '.err']:
                 path = f"{name}{ext}"
                 if os.path.exists(path):
@@ -763,26 +867,35 @@ Example usage:
             sys.exit(1)
         if not submit_job(script2_path):
             sys.exit(1)
+        if not submit_job(script3_path):
+            sys.exit(1)
 
         # Wait for jobs to be ready
         log(f"Waiting for servers to be ready (min {args.server_wait_time}s)...")
 
         node1_ip = wait_for_job_ready(job1_name, min_time=args.server_wait_time)
         if not node1_ip:
-            log("ERROR: Node 1 (agent + expert-1/2) failed to start")
+            log("ERROR: Node 1 (agent + expert-2) failed to start")
             sys.exit(1)
         log(f"Node 1 ready: {node1_ip}")
 
         node2_ip = wait_for_job_ready(job2_name, min_time=args.server_wait_time)
         if not node2_ip:
-            log("ERROR: Node 2 (expert-3) failed to start")
+            log("ERROR: Node 2 (expert-1) failed to start")
             sys.exit(1)
         log(f"Node 2 ready: {node2_ip}")
+
+        node3_ip = wait_for_job_ready(job3_name, min_time=args.server_wait_time)
+        if not node3_ip:
+            log("ERROR: Node 3 (expert-3) failed to start")
+            sys.exit(1)
+        log(f"Node 3 ready: {node3_ip}")
 
         # Generate model config
         generate_model_config(
             node1_ip=node1_ip,
             node2_ip=node2_ip,
+            node3_ip=node3_ip,
             ckpt_dir=args.agent_model,
             output_path=args.model_config_path
         )
@@ -859,9 +972,9 @@ Example usage:
     log("\n" + "=" * 60)
     log("EVALUATION SUMMARY (OSS Expert Models)")
     log("=" * 60)
-    log(f"Expert-1: openai/gpt-oss-120b (EAGLE3)")
-    log(f"Expert-2: openai/gpt-oss-20b (EAGLE3)")
-    log(f"Expert-3: Qwen/Qwen3-Next-80B-A3B-Instruct (MTP)")
+    log(f"Expert-1: openai/gpt-oss-20b (no speculator)")
+    log(f"Expert-2: Qwen/Qwen3-32B-FP8 (non-thinking)")
+    log(f"Expert-3: Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 (MTP 4 tokens)")
     log("-" * 60)
     for domain, status in results.items():
         log(f"{domain.upper()}: {status}")
