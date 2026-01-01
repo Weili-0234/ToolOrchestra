@@ -84,8 +84,31 @@ def load_docs(corpus, doc_idxs):
 def load_model(model_path: str, use_fp16: bool = False):
     if model_path in ['Qwen/Qwen3-Embedding-8B']:
         tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side='left')
-        model = AutoModel.from_pretrained(model_path, attn_implementation="flash_attention_2",
-                                          torch_dtype=torch.float16).cuda()
+        # Prefer FlashAttention2 when available, but fall back gracefully if the
+        # environment doesn't have `flash_attn` installed (common in fresh/CPU-only envs).
+        try:
+            model = AutoModel.from_pretrained(
+                model_path,
+                attn_implementation="flash_attention_2",
+                torch_dtype=torch.float16,
+            ).cuda()
+        except Exception as e:
+            print(
+                f"[retrieval_hle] WARNING: flash_attention_2 unavailable ({type(e).__name__}: {e}); "
+                "falling back to SDPA/eager attention.",
+                flush=True,
+            )
+            try:
+                model = AutoModel.from_pretrained(
+                    model_path,
+                    attn_implementation="sdpa",
+                    torch_dtype=torch.float16,
+                ).cuda()
+            except Exception:
+                model = AutoModel.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.float16,
+                ).cuda()
     else:
         model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         model = AutoModel.from_pretrained(model_path, trust_remote_code=True)

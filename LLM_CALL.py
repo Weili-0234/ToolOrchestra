@@ -494,8 +494,9 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
         return answer
     elif 'qwen' in model.lower() or model_type=='vllm':
         # Check if we should use Nebius API for Qwen3-32B
+        # Only use Nebius if model_config is not provided (i.e., not using local vLLM)
         nebius_api_key = os.getenv("NEBIUS_API_KEY")
-        use_nebius = nebius_api_key and 'qwen3-32b' in model.lower()
+        use_nebius = nebius_api_key and 'qwen3-32b' in model.lower() and not model_config
 
         if use_nebius:
             # Use Nebius API for Qwen3-32B
@@ -561,25 +562,24 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                                 first_token_ts = time.time()
 
                         # Ask for usage in the final chunk if supported by the server/client.
+                        extra_body = kwargs.get("extra_body")
+                        stream_create_kwargs = {
+                            "model": model,
+                            "messages": messages,
+                            "max_tokens": max_length,
+                            "temperature": temperature,
+                            "tools": tools,
+                            "stream": True,
+                        }
+                        if extra_body:
+                            stream_create_kwargs["extra_body"] = extra_body
                         try:
                             stream = vllm_client.chat.completions.create(
-                                model=model,
-                                messages=messages,
-                                max_tokens=max_length,
-                                temperature=temperature,
-                                tools=tools,
-                                stream=True,
+                                **stream_create_kwargs,
                                 stream_options={"include_usage": True},
                             )
                         except Exception:
-                            stream = vllm_client.chat.completions.create(
-                                model=model,
-                                messages=messages,
-                                max_tokens=max_length,
-                                temperature=temperature,
-                                tools=tools,
-                                stream=True,
-                            )
+                            stream = vllm_client.chat.completions.create(**stream_create_kwargs)
 
                         for chunk in stream:
                             try:
@@ -726,13 +726,17 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                                     ensure_ascii=False,
                                 )
                     else:
-                        chat_completion = vllm_client.chat.completions.create(
-                            model=model,
-                            messages=messages,
-                            max_tokens=max_length,
-                            temperature=temperature,
-                            tools=tools
-                        )
+                        extra_body = kwargs.get("extra_body")
+                        create_kwargs = {
+                            "model": model,
+                            "messages": messages,
+                            "max_tokens": max_length,
+                            "temperature": temperature,
+                            "tools": tools,
+                        }
+                        if extra_body:
+                            create_kwargs["extra_body"] = extra_body
+                        chat_completion = vllm_client.chat.completions.create(**create_kwargs)
                         req_dur = time.time() - req_start
                         print(f"DEBUG: vLLM request successful (took {req_dur:.2f}s) req_id={req_id}", flush=True)
                         _llm_log({
