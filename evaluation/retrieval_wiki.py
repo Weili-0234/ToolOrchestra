@@ -16,6 +16,10 @@ import os
 import json
 from typing import List, Optional
 import argparse
+import time
+import threading
+from concurrent.futures import Future
+from queue import Empty, Queue
 
 import faiss
 import torch
@@ -28,14 +32,37 @@ import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "y", "on"}
+
 def load_corpus(corpus_path: str):
-    corpus = datasets.load_dataset(
-        'json',
+    num_proc = int(os.environ.get("WIKI_CORPUS_NUM_PROC", "16"))
+    cache_dir = os.environ.get("WIKI_HF_CACHE_DIR", "cache/huggingface")
+    keep_in_memory = _env_flag("WIKI_CORPUS_KEEP_IN_MEMORY", "0")
+
+    load_kwargs = dict(
         data_files=corpus_path,
         split="train",
-        num_proc=16,
-        cache_dir='cache/huggingface'
+        num_proc=num_proc,
+        cache_dir=cache_dir,
     )
+    if keep_in_memory:
+        load_kwargs["keep_in_memory"] = True
+
+    try:
+        corpus = datasets.load_dataset("json", **load_kwargs)
+    except TypeError as e:
+        # Backward compatibility for older `datasets` versions.
+        if "keep_in_memory" in load_kwargs and "keep_in_memory" in str(e):
+            print(
+                "[retrieval_wiki] WARNING: datasets.load_dataset() does not support keep_in_memory; "
+                "retrying without it.",
+                flush=True,
+            )
+            load_kwargs.pop("keep_in_memory", None)
+            corpus = datasets.load_dataset("json", **load_kwargs)
+        else:
+            raise
     return corpus
 
 def last_token_pool(last_hidden_states,attention_mask):
@@ -57,15 +84,44 @@ def read_jsonl(file_path):
 
 
 def load_docs(corpus, doc_idxs):
-    results = [corpus[int(idx)] for idx in doc_idxs]
+    # `doc_idxs` can be a numpy array; FAISS uses -1 for missing entries.
+    results = []
+    for idx in doc_idxs:
+        ii = int(idx)
+        if ii < 0:
+            continue
+        results.append(corpus[ii])
     return results
 
 
 def load_model(model_path: str, use_fp16: bool = False):
     if model_path in ['Qwen/Qwen3-Embedding-8B']:
         tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side='left')
-        model = AutoModel.from_pretrained(model_path, attn_implementation="flash_attention_2",
-                                          torch_dtype=torch.float16).cuda()
+        # Prefer FlashAttention2 when available, but fall back gracefully if the
+        # environment doesn't have `flash_attn` installed.
+        try:
+            model = AutoModel.from_pretrained(
+                model_path,
+                attn_implementation="flash_attention_2",
+                torch_dtype=torch.float16,
+            ).cuda()
+        except Exception as e:
+            print(
+                f"[retrieval_wiki] WARNING: flash_attention_2 unavailable ({type(e).__name__}: {e}); "
+                "falling back to SDPA/eager attention.",
+                flush=True,
+            )
+            try:
+                model = AutoModel.from_pretrained(
+                    model_path,
+                    attn_implementation="sdpa",
+                    torch_dtype=torch.float16,
+                ).cuda()
+            except Exception:
+                model = AutoModel.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.float16,
+                ).cuda()
     else:
         model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
@@ -162,7 +218,9 @@ class Encoder:
         query_emb = query_emb.astype(np.float32, order="C")
 
         del inputs, output
-        torch.cuda.empty_cache()
+        # `torch.cuda.empty_cache()` can add significant latency per request; keep it off by default.
+        if _env_flag("WIKI_TORCH_EMPTY_CACHE", "0"):
+            torch.cuda.empty_cache()
 
         return query_emb
 
@@ -194,13 +252,44 @@ class DenseRetriever(BaseRetriever):
         super().__init__(config)
         self.index = faiss.read_index(self.index_path)
         if config.faiss_gpu:
-            co = faiss.GpuMultipleClonerOptions()
-            co.useFloat16 = True
-            co.shard = True
-            print(185,'move to faiss gpu')
-            self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
+            ngpu = faiss.get_num_gpus()
+            min_gpus = int(os.environ.get("WIKI_FAISS_GPU_MIN_GPUS", "2"))
+            if ngpu < min_gpus:
+                print(
+                    f"[retrieval_wiki] WARNING: WIKI_FAISS_GPU requested but only {ngpu} GPU(s) visible "
+                    f"(<{min_gpus}); keeping CPU FAISS index.",
+                    flush=True,
+                )
+            else:
+                co = faiss.GpuMultipleClonerOptions()
+                co.useFloat16 = True
+                co.shard = True
+                print(
+                    f"[retrieval_wiki] Moving FAISS index to GPU(s): ngpu={ngpu} shard={co.shard} fp16={co.useFloat16}",
+                    flush=True,
+                )
+                self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
 
         self.corpus = load_corpus(self.corpus_path)
+        if _env_flag("WIKI_PRELOAD_CORPUS", "1"):
+            print("[retrieval_wiki] Preloading corpus into memory ...", flush=True)
+            preload_t0 = time.perf_counter()
+            total = None
+            try:
+                total = len(self.corpus)
+            except Exception:
+                total = None
+            corpus_cache = []
+            # Iteration is sequential and much faster than random access via `corpus[idx]`.
+            for doc in tqdm(self.corpus, desc="Loading corpus", total=total):
+                corpus_cache.append(doc)
+            self.corpus = corpus_cache
+            print(
+                f"[retrieval_wiki] Corpus preloaded: {len(self.corpus)} docs in "
+                f"{time.perf_counter() - preload_t0:.1f}s",
+                flush=True,
+            )
+
         self.encoder = Encoder(
             model_name=self.retrieval_method,
             model_path=config.retrieval_model_path,
@@ -232,7 +321,10 @@ class DenseRetriever(BaseRetriever):
 
         results = []
         scores = []
-        for start_idx in tqdm(range(0, len(query_list), self.batch_size), desc='Retrieval process: '):
+        batch_iter = range(0, len(query_list), self.batch_size)
+        if _env_flag("WIKI_RETRIEVAL_TQDM", "0"):
+            batch_iter = tqdm(batch_iter, desc="Retrieval process")
+        for start_idx in batch_iter:
             query_batch = query_list[start_idx:start_idx + self.batch_size]
             batch_emb = self.encoder.encode(query_batch)
             batch_scores, batch_idxs = self.index.search(batch_emb, k=num)
@@ -249,7 +341,9 @@ class DenseRetriever(BaseRetriever):
             scores.extend(batch_scores)
 
             del batch_emb, batch_scores, batch_idxs, query_batch, flat_idxs, batch_results
-            torch.cuda.empty_cache()
+            # `torch.cuda.empty_cache()` can add significant latency per request; keep it off by default.
+            if _env_flag("WIKI_TORCH_EMPTY_CACHE", "0"):
+                torch.cuda.empty_cache()
 
         if return_score:
             return results, scores
@@ -260,6 +354,84 @@ class DenseRetriever(BaseRetriever):
 #####################################
 # FastAPI server below
 #####################################
+
+class RequestBatcher:
+    """
+    Server-side request batching to amortize embedding encode cost across concurrent /retrieve calls.
+
+    Enabled with:
+      WIKI_REQUEST_BATCHING=1
+
+    Tunables:
+      WIKI_BATCH_TIMEOUT_S (default 0.05): how long to wait to form a batch after the first request arrives
+      WIKI_MAX_BATCH_REQUESTS (default 16): max number of HTTP requests per batch
+      WIKI_MAX_BATCH_QUERIES (default 16): max total queries per batch across all requests
+    """
+
+    def __init__(
+        self,
+        retriever: DenseRetriever,
+        batch_timeout_s: float = 0.05,
+        max_batch_requests: int = 16,
+        max_batch_queries: int = 16,
+    ):
+        self.retriever = retriever
+        self.batch_timeout_s = float(batch_timeout_s)
+        self.max_batch_requests = int(max_batch_requests)
+        self.max_batch_queries = int(max_batch_queries)
+        self._q: "Queue[dict]" = Queue()
+        self._worker = threading.Thread(target=self._loop, daemon=True)
+        self._worker.start()
+
+    def submit(self, queries: List[str], num: int):
+        fut: Future = Future()
+        self._q.put({"queries": list(queries), "num": int(num), "future": fut})
+        return fut
+
+    def _loop(self):
+        while True:
+            first = self._q.get()
+            batch = [first]
+            total_queries = len(first.get("queries") or [])
+            deadline = time.monotonic() + self.batch_timeout_s
+
+            while len(batch) < self.max_batch_requests and total_queries < self.max_batch_queries:
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    break
+                try:
+                    nxt = self._q.get(timeout=timeout)
+                except Empty:
+                    break
+                batch.append(nxt)
+                total_queries += len(nxt.get("queries") or [])
+
+            # Partition by `num` so we never mix different K in a single FAISS call.
+            by_num: dict[int, list[dict]] = {}
+            for item in batch:
+                by_num.setdefault(int(item["num"]), []).append(item)
+
+            for num, items in by_num.items():
+                flat_queries: List[str] = []
+                spans: List[tuple[int, int, dict]] = []
+                for item in items:
+                    q = item.get("queries") or []
+                    start = len(flat_queries)
+                    flat_queries.extend(q)
+                    spans.append((start, len(flat_queries), item))
+
+                if not flat_queries:
+                    for _, _, item in spans:
+                        item["future"].set_result(([], []))
+                    continue
+
+                try:
+                    results, scores = self.retriever.batch_search(flat_queries, num=num, return_score=True)
+                    for start, end, item in spans:
+                        item["future"].set_result((results[start:end], scores[start:end]))
+                except Exception as e:
+                    for _, _, item in spans:
+                        item["future"].set_exception(e)
 
 class Config:
     """
@@ -311,6 +483,10 @@ class QueryRequest(BaseModel):
 
 app = FastAPI()
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 
 @app.post("/retrieve")
 def retrieve_endpoint(request: QueryRequest):
@@ -326,12 +502,18 @@ def retrieve_endpoint(request: QueryRequest):
     if not request.topk:
         request.topk = config.retrieval_topk  # fallback to default
 
-    # Perform batch retrieval
-    results, scores = retriever.batch_search(
-        query_list=request.queries,
-        num=1000,
-        return_score=request.return_scores
-    )
+    internal_k = int(os.environ.get("WIKI_RETRIEVAL_INTERNAL_TOPK", "1000"))
+
+    # Perform batch retrieval - always get scores to avoid unpacking issues
+    if request_batcher is not None:
+        fut = request_batcher.submit(queries=request.queries, num=internal_k)
+        results, scores = fut.result()
+    else:
+        results, scores = retriever.batch_search(
+            query_list=request.queries,
+            num=internal_k,
+            return_score=True,
+        )
 
     # Format response
     resp = []
@@ -361,7 +543,9 @@ config = Config(
     index_path=os.path.join(os.environ.get('INDEX_DIR',None),'wiki.index'),
     corpus_path=os.path.join(os.environ.get('INDEX_DIR',None),'wiki.jsonl'),
     retrieval_topk=3,
-    faiss_gpu=True,
+    # wiki.index is extremely large (~100GB). Moving it to GPU requires massive GPU memory
+    # and will OOM on typical single-GPU jobs. Default to CPU FAISS.
+    faiss_gpu=os.environ.get("WIKI_FAISS_GPU", "0").strip().lower() in {"1", "true", "yes"},
     retrieval_model_path='Qwen/Qwen3-Embedding-8B',
     retrieval_pooling_method="mean",
     retrieval_query_max_length=32768,
@@ -370,6 +554,21 @@ config = Config(
 )
 
 retriever = DenseRetriever(config)
+request_batcher = None
+if _env_flag("WIKI_REQUEST_BATCHING", "0"):
+    request_batcher = RequestBatcher(
+        retriever,
+        batch_timeout_s=float(os.environ.get("WIKI_BATCH_TIMEOUT_S", "0.05")),
+        max_batch_requests=int(os.environ.get("WIKI_MAX_BATCH_REQUESTS", "16")),
+        max_batch_queries=int(os.environ.get("WIKI_MAX_BATCH_QUERIES", "16")),
+    )
+    print(
+        "[retrieval_wiki] Request batching enabled: "
+        f"timeout={request_batcher.batch_timeout_s}s "
+        f"max_requests={request_batcher.max_batch_requests} "
+        f"max_queries={request_batcher.max_batch_queries}",
+        flush=True,
+    )
 
 uvicorn.run(app, host="0.0.0.0", port=args.port)
 
