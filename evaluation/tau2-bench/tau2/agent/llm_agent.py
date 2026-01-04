@@ -192,8 +192,6 @@ class LLMGTAgent(LocalAgent[LLMAgentState]):
         If provide_function_args is True, the resolution steps will include the function arguments.
         """
         super().__init__(tools=tools, domain_policy=domain_policy)
-        print(178,tools)
-        exit(0)
         assert self.check_valid_task(task), (
             f"Task {task.id} is not valid. Cannot run GT agent."
         )

@@ -3,6 +3,8 @@ import pytest
 from tau2.data_model.message import AssistantMessage, UserMessage
 from tau2.user.user_simulator import UserSimulator
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.fixture
 def user_instructions() -> str:

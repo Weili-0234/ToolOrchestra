@@ -49,3 +49,9 @@ ignore = ["E501", "F401", "F541"]
 
 [tool.ruff]
 line-length = 88
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests as integration tests (require external services)",
+    "router: marks tests that require ThunderReact router",
+]

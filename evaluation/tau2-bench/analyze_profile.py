@@ -1,12 +1,36 @@
 #!/usr/bin/env python3
 """
-Analyze tau2-bench profiling logs.
-Outputs per-expert latency stats with enhanced metrics:
-- Percentiles: p10, p25, p40, p50, p90, p95, p99
-- SLA compliance: <5s%
-- Prefill/decode breakdown for vLLM models
-- PNG charts with matplotlib
-- Detailed markdown report
+Analyze tau2-bench profiling logs and generate latency plots/reports.
+
+## What experiment are these plots for?
+This script is used for the Tau2-Bench **OSS expert** evaluation run recorded in:
+`evaluation/tau2-bench/WORKLOG_20251230.md` (Date: 2025-12-30).
+
+**Setup (from the worklog):**
+- **Agent / orchestrator**: Nemotron-Orchestrator-8B
+- **Experts (tools)**:
+  - Expert-1: openai/gpt-oss-20b
+  - Expert-2: Qwen/Qwen3-32B-FP8
+  - Expert-3: Qwen/Qwen3-Next-80B-A3B-Instruct-FP8
+- Plus Tau2-Bench local python tools (logged as `type=tool_call`)
+
+## Inputs
+- Tau2-Bench domain profiling logs emitted with `--log-level PROFILE`, e.g.:
+  - `evaluation/tau2-bench/logs_oss_full/tau2_airline.log`
+  - `evaluation/tau2-bench/logs_oss_full/tau2_retail.log`
+  - `evaluation/tau2-bench/logs_oss_full/tau2_telecom.log`
+
+## Outputs
+- `profile_analysis.json`: aggregated latency stats per model/role
+- `experiment_report_<timestamp>.md`: markdown report
+- `profile_charts/*.png`: figures including:
+  - per-model latency distribution + CDF
+  - stacked **all experts** latency distribution (truncated to 10s)
+  - stacked **all tools (experts + local python)** latency distribution (truncated to 10s)
+
+## Notes on the figures
+- Histograms are plotted as **percent of calls per bin** (not raw counts).
+- Some plots **truncate/collapse the tail** into the last visible bin for readability (see on-plot notes).
 """
 
 import re
@@ -185,6 +209,7 @@ def compute_stats(values: List[float]) -> Dict[str, Any]:
         "p30": float(np.percentile(arr, 30)),
         "p40": float(np.percentile(arr, 40)),
         "p50": float(np.percentile(arr, 50)),
+        "p75": float(np.percentile(arr, 75)),
         "p60": float(np.percentile(arr, 60)),
         "p70": float(np.percentile(arr, 70)),
         "p80": float(np.percentile(arr, 80)),
@@ -304,38 +329,293 @@ def generate_png_charts(data: Dict[str, Any], output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
     latencies = data["latencies"]
 
+    # Consistent colors (requested: 3 experts distinct; all python local tools one color)
+    COLOR_EXPERT1 = "#1f77b4"  # gpt-oss-20b
+    COLOR_EXPERT2 = "#2ca02c"  # Qwen3-32B-FP8
+    COLOR_EXPERT3 = "#ff7f0e"  # Qwen3-Next-80B-A3B
+    COLOR_PYTOOLS = "#7f7f7f"  # local python tools
+    COLOR_OTHER = "#9467bd"
+
+    def _role_and_tool_label(model_key: str) -> str:
+        """
+        Return a concise label for what this latency series represents in this tau2-bench setup.
+        We keep this intentionally lightweight and based on WORKLOG_20251230.md's mapping.
+        """
+        if model_key == "orchestrator":
+            return "Role: orchestrator (agent core)"
+        if model_key.startswith("user_sim:"):
+            return "Role: user simulator"
+        if model_key.startswith("expert:"):
+            # Map the 3 expert tools used in this experiment
+            if "openai/gpt-oss-20b" in model_key:
+                return "Tool: Expert-1 (gpt-oss-20b)"
+            if "Qwen/Qwen3-32B-FP8" in model_key:
+                return "Tool: Expert-2 (Qwen3-32B-FP8)"
+            if "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8" in model_key:
+                return "Tool: Expert-3 (Qwen3-Next-80B-A3B)"
+            return "Tool: expert"
+        return "Role: unknown"
+
+    def _series_color(model_key: str) -> str:
+        if model_key.startswith("expert:") and ("openai/gpt-oss-20b" in model_key):
+            return COLOR_EXPERT1
+        if model_key.startswith("expert:") and ("Qwen/Qwen3-32B-FP8" in model_key):
+            return COLOR_EXPERT2
+        if model_key.startswith("expert:") and ("Qwen/Qwen3-Next-80B-A3B-Instruct-FP8" in model_key):
+            return COLOR_EXPERT3
+        if model_key == "orchestrator":
+            return COLOR_OTHER
+        if model_key.startswith("user_sim:"):
+            return COLOR_OTHER
+        return COLOR_OTHER
+
+    def _fmt_ms(x: float) -> str:
+        # Adaptive formatting so very small values don't appear as 0.0.
+        ax = abs(float(x))
+        if ax < 1.0:
+            return f"{x:.3f}"
+        if ax < 10.0:
+            return f"{x:.2f}"
+        if ax < 100.0:
+            return f"{x:.1f}"
+        return f"{x:.0f}"
+
+    def _fmt_s(x: float) -> str:
+        ax = abs(float(x))
+        if ax < 0.01:
+            return f"{x:.4f}"
+        if ax < 0.1:
+            return f"{x:.3f}"
+        if ax < 1.0:
+            return f"{x:.2f}"
+        if ax < 10.0:
+            return f"{x:.2f}"
+        return f"{x:.1f}"
+
+    def _add_stats_box(ax, stats: Dict[str, Any], role_label: str):
+        # Expanded stats box with more percentiles as requested.
+        # Using adaptive ms formatting so very small values don't appear as 0.0.
+        txt = (
+            f"{role_label}\n"
+            f"n={stats['count']}  <5s={stats['under_5s_pct']:.1f}%\n"
+            f"mean={_fmt_ms(stats['mean'])}ms  std={_fmt_ms(stats['std'])}ms\n"
+            f"p10={_fmt_ms(stats['p10'])} p20={_fmt_ms(stats['p20'])} p25={_fmt_ms(stats['p25'])}\n"
+            f"p40={_fmt_ms(stats['p40'])} p50={_fmt_ms(stats['p50'])} p75={_fmt_ms(stats['p75'])}\n"
+            f"p90={_fmt_ms(stats['p90'])} p95={_fmt_ms(stats['p95'])} p99={_fmt_ms(stats['p99'])}"
+        )
+        ax.text(
+            0.98,
+            0.98,
+            txt,
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=9,
+            bbox=dict(facecolor="white", alpha=0.85, edgecolor="#cccccc", boxstyle="round,pad=0.35"),
+        )
+
+    def _make_edges(x_max_s: float, bin_w_s: float) -> np.ndarray:
+        # Ensure last edge lands on a multiple of bin_w_s
+        bin_w_s = float(bin_w_s)
+        x_max_s = float(np.ceil(x_max_s / bin_w_s) * bin_w_s)
+        n = int(round(x_max_s / bin_w_s))
+        return np.arange(0.0, (n + 1) * bin_w_s, bin_w_s, dtype=float)
+
+    def _hist_percent(vals_s: np.ndarray, edges_s: np.ndarray) -> np.ndarray:
+        counts, _ = np.histogram(vals_s, bins=edges_s)
+        total = max(len(vals_s), 1)
+        return counts.astype(float) / total * 100.0
+
+    def _hist_counts(vals_s: np.ndarray, edges_s: np.ndarray) -> np.ndarray:
+        counts, _ = np.histogram(vals_s, bins=edges_s)
+        return counts.astype(float)
+
+    def _plot_hist_percent(ax, vals_ms: np.ndarray, edges_s: np.ndarray, color: str, label: str, collapse_at_s: float | None):
+        vals_s = vals_ms / 1000.0
+        if collapse_at_s is not None:
+            vals_s = vals_s.copy()
+            vals_s[vals_s >= collapse_at_s] = (edges_s[-1] - 1e-6)
+        pct = _hist_percent(vals_s, edges_s)
+        ax.bar(
+            edges_s[:-1],
+            pct,
+            width=np.diff(edges_s),
+            align="edge",
+            edgecolor="black",
+            alpha=0.8,
+            color=color,
+            label=label,
+        )
+        return pct
+
+    def _annotate_cdf_percentiles(
+        ax,
+        vals_s_full: np.ndarray,
+        *,
+        x_cap_s: float,
+        percentiles: list[int],
+    ):
+        """
+        Denote percentile -> latency mapping directly on the CDF panel.
+        We draw a small marker at (x, p) (clamped to x_cap_s) and print the label at the right edge at y=p.
+        """
+        if vals_s_full.size == 0:
+            return
+        xlim = ax.get_xlim()
+        x_right = xlim[1] - 0.015 * (xlim[1] - xlim[0])
+        for p in percentiles:
+            x = float(np.percentile(vals_s_full, p))
+            x_plot = min(x, x_cap_s - 1e-6)
+            ax.scatter([x_plot], [p], s=16, color="#444444", zorder=6, label="_nolegend_")
+            if x <= x_cap_s:
+                label = f"P{p}={_fmt_s(x)}s"
+            else:
+                label = f"P{p}={_fmt_s(x)}s (> {x_cap_s:g}s)"
+            ax.text(
+                x_right,
+                p,
+                label,
+                ha="right",
+                va="center",
+                fontsize=8,
+                color="#333333",
+                bbox=dict(facecolor="white", alpha=0.6, edgecolor="none", pad=0.8),
+            )
+
     for name, values in latencies.items():
         if not values:
             continue
 
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        # Layout: histogram on top, CDF below. Share x-axis so ticks align.
+        fig, axes = plt.subplots(
+            2,
+            1,
+            figsize=(14, 8),
+            sharex=True,
+            gridspec_kw={"height_ratios": [1.0, 1.0]},
+        )
 
         # Histogram
         ax1 = axes[0]
         arr = np.array(values)
-        ax1.hist(arr, bins=20, edgecolor='black', alpha=0.7)
-        ax1.axvline(np.percentile(arr, 50), color='r', linestyle='--', label=f'P50: {np.percentile(arr, 50):.1f}ms')
-        ax1.axvline(np.percentile(arr, 95), color='orange', linestyle='--', label=f'P95: {np.percentile(arr, 95):.1f}ms')
-        ax1.axvline(5000, color='green', linestyle=':', label='5s SLA')
-        ax1.set_xlabel('Latency (ms)')
-        ax1.set_ylabel('Count')
-        ax1.set_title(f'{name} - Latency Distribution')
+
+        stats = compute_stats(values)
+        role_label = _role_and_tool_label(name)
+
+        # We plot histogram as "% of calls per bin", not raw count.
+        # Binning: 0.5s bins for experts (requested), with a gpt-oss-20b special tail bin.
+        is_gptoss = name.startswith("expert:") and ("openai/gpt-oss-20b" in name)
+        if is_gptoss:
+            # 0.5s bins up to 9s; rightmost shown tick label should be real max seconds (tail)
+            collapse_at_s = 9.0
+            x_max_display_s = 9.5  # last visible bin [9.0, 9.5) represents tail (>=9.0s)
+            edges_s = _make_edges(x_max_display_s, 0.5)
+            max_s = float(np.max(arr) / 1000.0)
+            series_color = _series_color(name)
+            _plot_hist_percent(
+                ax1,
+                arr,
+                edges_s,
+                color=series_color,
+                label="Histogram (% per 0.5s bin; tail collapsed into last bin)",
+                collapse_at_s=collapse_at_s,
+            )
+            ax1.set_xlim(0.0, x_max_display_s)
+            # Ticks: keep clean; label the last tick with the real max.
+            ticks = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9.5]
+            ax1.set_xticks(ticks)
+            ax1.set_xticklabels([f"{t:g}s" if t != 9.5 else f"{max_s:.0f}s (tail)" for t in ticks])
+        else:
+            # Default: show up to ~p99 (slightly padded) and collapse tail into the last bin.
+            x_max_s = float(np.ceil((stats["p99"] * 1.10) / 1000.0 / 0.5) * 0.5)
+            x_max_s = max(x_max_s, 3.0)
+            edges_s = _make_edges(x_max_s, 0.5)
+            series_color = _series_color(name)
+            _plot_hist_percent(
+                ax1,
+                arr,
+                edges_s,
+                color=series_color,
+                label="Histogram (% per 0.5s bin; tail collapsed)",
+                collapse_at_s=x_max_s,
+            )
+            ax1.set_xlim(0.0, float(edges_s[-1]))
+            # Ticks every 1s for readability.
+            max_tick = float(edges_s[-1])
+            tick_vals = list(np.arange(0.0, max_tick + 1e-9, 1.0))
+            ax1.set_xticks(tick_vals)
+            ax1.set_xticklabels([f"{t:g}s" for t in tick_vals])
+
+        ax1.axvline(stats["p50"] / 1000.0, color='r', linestyle='--', label=f"P50: {stats['p50']:.0f}ms")
+        ax1.axvline(stats["p95"] / 1000.0, color='orange', linestyle='--', label=f"P95: {stats['p95']:.0f}ms")
+        ax1.axvline(5.0, color='green', linestyle=':', label=f"5s SLA (<5s={stats['under_5s_pct']:.1f}%)")
+        ax1.set_xlabel("Latency (s)")
+        ax1.set_ylabel("Percent of calls (%)")
+        ax1.set_title("Histogram (% of calls per 0.5s bin)")
         ax1.legend()
         ax1.grid(True, alpha=0.3)
+        _add_stats_box(ax1, stats, role_label)
 
         # CDF
         ax2 = axes[1]
-        sorted_vals = np.sort(arr)
+        # Use the same truncated/collapsed view as the histogram for alignment.
+        vals_s_full = (arr / 1000.0).copy()
+        vals_s = vals_s_full.copy()
+        if is_gptoss:
+            vals_s[vals_s >= 9.0] = edges_s[-1] - 1e-6
+            note = f"CDF shown up to 9s; tail collapsed (max={float(np.max(arr)/1000.0):.0f}s)"
+        else:
+            # collapse at the right edge
+            collapse_at_s = float(edges_s[-1])
+            vals_s[vals_s >= collapse_at_s] = edges_s[-1] - 1e-6
+            note = f"CDF x-axis truncated at {edges_s[-1]:g}s; tail collapsed"
+        sorted_vals = np.sort(vals_s)
         cdf = np.arange(1, len(sorted_vals) + 1) / len(sorted_vals) * 100
         ax2.plot(sorted_vals, cdf, 'b-', linewidth=2)
-        ax2.axhline(50, color='r', linestyle='--', alpha=0.5, label='P50')
-        ax2.axhline(95, color='orange', linestyle='--', alpha=0.5, label='P95')
-        ax2.axvline(5000, color='green', linestyle=':', label='5s SLA')
-        ax2.set_xlabel('Latency (ms)')
-        ax2.set_ylabel('Percentile (%)')
-        ax2.set_title(f'{name} - CDF')
+        ax2.axvline(5.0, color='green', linestyle=':', label=f"5s SLA (<5s={stats['under_5s_pct']:.1f}%)")
+        # Mark the actual CDF at 5s explicitly
+        ax2.scatter([5.0], [stats["under_5s_pct"]], color="green", s=18, zorder=5)
+        ax2.annotate(
+            f"<5s: {stats['under_5s_pct']:.1f}%",
+            xy=(5.0, stats["under_5s_pct"]),
+            xytext=(8, 8),
+            textcoords="offset points",
+            fontsize=9,
+            color="green",
+            bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", pad=1.5),
+        )
+        ax2.set_xlabel("Latency (s)")
+        ax2.set_ylabel("CDF (%)")
+        ax2.set_title("CDF (aligned x-axis)")
+        ax2.set_ylim(0, 100)
+        ax2.text(
+            0.02,
+            0.06,
+            note,
+            transform=ax2.transAxes,
+            ha="left",
+            va="bottom",
+            fontsize=9,
+            bbox=dict(facecolor="white", alpha=0.75, edgecolor="#dddddd", boxstyle="round,pad=0.25"),
+        )
         ax2.legend()
         ax2.grid(True, alpha=0.3)
+        # Keep CDF cleaner; the histogram already has the full stats box.
+        _annotate_cdf_percentiles(
+            ax2,
+            vals_s_full,
+            x_cap_s=float(edges_s[-1]),
+            percentiles=[10, 20, 25, 40, 50, 75, 90, 95],
+        )
+
+        fig.suptitle(
+            f"Tau2-Bench tool use latency distribution — {role_label} — model={name}",
+            fontsize=12,
+            y=0.98,
+        )
+
+        # Ensure top axis also shows x tick labels (requested).
+        ax1.tick_params(axis="x", labelbottom=True)
 
         plt.tight_layout()
 
@@ -345,6 +625,177 @@ def generate_png_charts(data: Dict[str, Any], output_dir: Path):
         plt.savefig(chart_path, dpi=150)
         plt.close()
         print(f"  Generated: {chart_path}")
+
+    # --- All experts (stacked) + All tools (experts + local python tools) ---
+    # Both truncated to 10s with 0.5s bins (requested) and show component mix per bin.
+    def _expert_component_series() -> list[tuple[str, np.ndarray, str]]:
+        comps: list[tuple[str, np.ndarray, str]] = []
+        for k, v in latencies.items():
+            if not (k.startswith("expert:") and v):
+                continue
+            label = _role_and_tool_label(k).replace("Tool: ", "")
+            comps.append((label, np.array(v, dtype=float), _series_color(k)))
+        # Keep stable ordering: Expert-1/2/3 if present
+        def _rank(lbl: str) -> int:
+            if "Expert-1" in lbl:
+                return 0
+            if "Expert-2" in lbl:
+                return 1
+            if "Expert-3" in lbl:
+                return 2
+            return 99
+        comps.sort(key=lambda x: _rank(x[0]))
+        return comps
+
+    def _python_tool_values() -> np.ndarray:
+        vals: list[float] = []
+        for (_domain, _tool), v in data.get("tool_calls", {}).items():
+            if v:
+                vals.extend(v)
+        return np.array(vals, dtype=float)
+
+    def _plot_stacked_components(out_name: str, title: str, components: list[tuple[str, np.ndarray, str]]):
+        all_vals = np.concatenate([c[1] for c in components if len(c[1]) > 0]) if components else np.array([], dtype=float)
+        if all_vals.size == 0:
+            return
+        stats = compute_stats(all_vals.tolist())
+
+        x_max_s = 10.0
+        # Requested: all-tools plot uses finer bins (0.2s); keep others at 0.5s.
+        bin_w_s = 0.2 if out_name == "all_tools_including_python_latency.png" else 0.5
+        edges_s = _make_edges(x_max_s, bin_w_s)
+        total_all = max(int(all_vals.size), 1)
+
+        # Layout: Top (Histogram) + Bottom (CDF), increased height to avoid overlap.
+        fig, axes = plt.subplots(
+            2,
+            1,
+            figsize=(16, 10),
+            sharex=True,
+            gridspec_kw={"height_ratios": [1.0, 0.6], "hspace": 0.15},
+        )
+        ax1, ax2 = axes[0], axes[1]
+
+        bottom = np.zeros(len(edges_s) - 1, dtype=float)
+        for label, vals_ms, color in components:
+            vals_s = (vals_ms / 1000.0).copy()
+            vals_s[vals_s >= x_max_s] = edges_s[-1] - 1e-6
+            # Normalize by GLOBAL total so stacked bars sum to 100% max.
+            counts = _hist_counts(vals_s, edges_s)
+            pct = counts / total_all * 100.0
+            ax1.bar(
+                edges_s[:-1],
+                pct,
+                width=np.diff(edges_s),
+                align="edge",
+                edgecolor="black",
+                alpha=0.85,
+                color=color,
+                label=f"{label} (n={len(vals_ms)})",
+                bottom=bottom,
+            )
+            bottom += pct
+
+        ax1.axvline(5.0, color="green", linestyle=":", label=f"5s SLA (<5s={stats['under_5s_pct']:.1f}%)")
+        ax1.set_xlabel("Latency (s)")
+        ax1.set_ylabel("Percent of calls (%)")
+        ax1.set_title(f"Histogram (% of calls per {bin_w_s:g}s bin, stacked by component)")
+        ax1.grid(True, alpha=0.3)
+        # Move legend outside to the right to avoid overlapping with the Stats Box
+        ax1.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=10, framealpha=0.9)
+        _add_stats_box(ax1, stats, title)
+        ax1.set_xlim(0.0, edges_s[-1])
+        tick_step = 1.0
+        tick_vals = list(np.arange(0.0, edges_s[-1] + 1e-9, tick_step))
+        ax1.set_xticks(tick_vals)
+        ax1.set_xticklabels([f"{t:g}s" for t in tick_vals])
+        ax1.tick_params(axis="x", labelbottom=True)  # Show x-ticks on top panel too
+
+        # Denote total % on every bin (use the stacked total in `bottom`)
+        # Keep labels horizontal as requested.
+        for i, total_pct in enumerate(bottom):
+            x_center = edges_s[i] + (edges_s[i + 1] - edges_s[i]) / 2.0
+            # Avoid placing text exactly at y=0
+            y = float(total_pct) + 0.2 if total_pct > 0 else 0.2
+            ax1.text(
+                x_center,
+                y,
+                f"{total_pct:.2f}%",
+                ha="center",
+                va="bottom",
+                fontsize=5 if bin_w_s <= 0.2 else 7,
+                rotation=0,
+                color="#111111",
+                clip_on=True,
+            )
+        
+        all_s = (all_vals / 1000.0).copy()
+        all_s[all_s >= x_max_s] = edges_s[-1] - 1e-6
+        sorted_vals = np.sort(all_s)
+        cdf = np.arange(1, len(sorted_vals) + 1) / len(sorted_vals) * 100
+        ax2.plot(sorted_vals, cdf, "b-", linewidth=2)
+
+        ax2.axvline(5.0, color="green", linestyle=":", label="5s SLA")
+        ax2.scatter([5.0], [stats["under_5s_pct"]], color="green", s=18, zorder=5)
+        ax2.annotate(
+            f"<5s: {stats['under_5s_pct']:.1f}%",
+            xy=(5.0, stats["under_5s_pct"]),
+            xytext=(8, -12),
+            textcoords="offset points",
+            fontsize=10,
+            color="green",
+            bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", pad=1.5),
+        )
+        ax2.set_xlabel("Latency (s)")
+        ax2.set_ylabel("CDF (%)")
+        ax2.set_title("CDF (aligned x-axis)")
+        ax2.set_ylim(0, 100)
+        ax2.text(
+            0.98,
+            0.08,
+            "CDF x-axis truncated at 10s; tail collapsed into last bin",
+            transform=ax2.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=10,
+            bbox=dict(facecolor="white", alpha=0.75, edgecolor="#dddddd", boxstyle="round,pad=0.25"),
+        )
+        ax2.grid(True, alpha=0.3)
+        # Denote percentiles directly on the CDF curve (requested).
+        _annotate_cdf_percentiles(
+            ax2,
+            (all_vals / 1000.0).copy(),
+            x_cap_s=float(edges_s[-1]),
+            percentiles=[10, 20, 25, 40, 50, 75, 90, 95],
+        )
+
+        fig.suptitle(title, fontsize=13, y=0.98)
+        # Manually adjust spacing to avoid overlap/clipping, allocating room for right legend
+        plt.subplots_adjust(top=0.93, bottom=0.08, left=0.08, right=0.82, hspace=0.25)
+        # plt.tight_layout() # Removed to respect manual adjustments
+        chart_path = output_dir / out_name
+        plt.savefig(chart_path, dpi=150)
+        plt.close()
+        print(f"  Generated: {chart_path}")
+
+    # All experts (3 components)
+    expert_components = _expert_component_series()
+    _plot_stacked_components(
+        out_name="experts_all3_combined_latency.png",
+        title="Tau2-Bench all experts tool use latency distribution (stacked by expert)",
+        components=expert_components,
+    )
+
+    # All tools (experts + local python tools as tool calls)
+    py_vals = _python_tool_values()
+    components_all_tools = list(expert_components)
+    if py_vals.size > 0:
+        components_all_tools.append(("local python tools", py_vals, COLOR_PYTOOLS))
+    _plot_stacked_components(
+        out_name="all_tools_including_python_latency.png",
+        title="Tau2-Bench all tools (experts + local python) tool use latency distribution (stacked by component)",
+        components=components_all_tools,
+    )
 
 
 def generate_markdown_report(data: Dict[str, Any], output_path: Path):

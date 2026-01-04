@@ -3,6 +3,8 @@ import pytest
 from tau2.agent.llm_agent import LLMAgent, LLMSoloAgent
 from tau2.data_model.message import AssistantMessage, UserMessage
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.fixture
 def agent(get_environment) -> LLMAgent:
@@ -10,6 +12,7 @@ def agent(get_environment) -> LLMAgent:
         llm="gpt-4o-mini",
         tools=get_environment().get_tools(),
         domain_policy=get_environment().get_policy(),
+        domain="mock",
     )
 
 

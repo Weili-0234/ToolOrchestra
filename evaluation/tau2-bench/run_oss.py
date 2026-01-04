@@ -20,13 +20,323 @@ import signal
 import argparse
 import subprocess
 import selectors
+import random
+import threading
+from concurrent.futures import ThreadPoolExecutor, Future, wait, FIRST_COMPLETED
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple, Iterator
 
 def log(msg: str):
     """Print timestamped log message"""
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    fh = globals().get("_DRIVER_LOG_FH")
+    if fh is not None:
+        try:
+            fh.write(line + "\n")
+            fh.flush()
+        except Exception:
+            pass
+
+
+# When running in global scheduling mode, we write driver logs to a single file.
+_DRIVER_LOG_FH = None  # type: ignore[assignment]
+
+
+def _open_driver_log(path: str):
+    global _DRIVER_LOG_FH
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        _DRIVER_LOG_FH = open(path, "a", encoding="utf-8", buffering=1)
+    except Exception:
+        _DRIVER_LOG_FH = None
+
+
+def _close_driver_log():
+    global _DRIVER_LOG_FH
+    try:
+        if _DRIVER_LOG_FH is not None:
+            _DRIVER_LOG_FH.close()
+    except Exception:
+        pass
+    _DRIVER_LOG_FH = None
+
+
+def _emit_task_complete_marker(
+    *,
+    domain: str,
+    trial: int,
+    task_id: str,
+    status: str,
+    completed_global: int,
+    total_global: int,
+) -> None:
+    # Machine-parsable marker for downstream throughput/ETA analysis.
+    line = (
+        "[TAU2_TASK_COMPLETE] "
+        f"domain={domain} trial={trial} task_id={task_id} status={status} "
+        f"completed_global={completed_global} total_global={total_global}",
+    )
+    print(line, flush=True)
+    fh = globals().get("_DRIVER_LOG_FH")
+    if fh is not None:
+        try:
+            fh.write(line + "\n")
+            fh.flush()
+        except Exception:
+            pass
+
+
+def _round_robin_items(
+    tasks_by_domain: Dict[str, List[Any]],
+    domains: List[str],
+    *,
+    num_trials: int,
+    trial_seeds: List[int],
+) -> List[Tuple[str, Any, int, int]]:
+    """
+    Build a global queue of (domain, task, trial, seed) in round-robin order.
+    This ensures different domains' tasks interleave.
+    """
+    items: List[Tuple[str, Any, int, int]] = []
+    for trial in range(num_trials):
+        per_domain_idx = {d: 0 for d in domains}
+        while True:
+            progressed = False
+            for d in domains:
+                idx = per_domain_idx[d]
+                if idx < len(tasks_by_domain.get(d, [])):
+                    items.append((d, tasks_by_domain[d][idx], trial, trial_seeds[trial]))
+                    per_domain_idx[d] = idx + 1
+                    progressed = True
+            if not progressed:
+                break
+    return items
+
+
+def _safe_filename(s: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in s)
+
+
+def run_global_evaluation(
+    *,
+    domains: List[str],
+    agent_llm: str,
+    user_llm: str,
+    task_paths: Dict[str, str],
+    model_config_path: str,
+    output_dir: str,
+    log_dir: str,
+    max_steps: int,
+    num_trials: int,
+    num_tasks: Optional[int],
+    max_concurrency: int,
+    use_model_tool: bool,
+    log_level: str,
+    max_errors: int = 10,
+    seed: int = 300,
+) -> int:
+    """
+    Global, cross-domain task scheduler:
+    - compute total tasks across all requested domains
+    - schedule tasks in a round-robin order across domains
+    - enforce a single global max_concurrency across all tasks
+
+    NOTE: We intentionally do NOT attempt to reuse Environment instances across tasks:
+    Environment carries task-specific state and is not safe to share across concurrent tasks.
+    """
+    # Import tau2 only when needed (keeps script usable even if tau2 deps are missing in some contexts)
+    from tau2.config import DEFAULT_LLM_ARGS_AGENT, DEFAULT_LLM_ARGS_USER
+    from tau2.run import get_tasks
+    from tau2.evaluator.evaluator import EvaluationType
+    from tau2.run import run_task
+    from tau2.utils.logging_config import configure_logging, set_task_context, clear_task_context
+
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Unified logs (not per-domain)
+    tau2_log_path = os.path.join(log_dir, "tau2_global.log")
+    eval_log_path = os.path.join(log_dir, "eval_global.log")
+    _open_driver_log(eval_log_path)
+    try:
+        log(f"Global logs: eval_log={eval_log_path} tau2_log={tau2_log_path}")
+
+        # Configure tau2 structured logging to a single file.
+        configure_logging(level=log_level, file_handler=tau2_log_path)
+
+        # Deterministic per-trial seeds (matches tau2/run.py behavior)
+        random.seed(seed)
+        trial_seeds = [random.randint(0, 1000000) for _ in range(num_trials)]
+
+        # Single output prefix -> per-task summaries written into <output_prefix_without_ext>/
+        output_file = os.path.join(output_dir, "all_domains.json")
+        save_dir = output_file[: -len(".json")]
+        os.makedirs(save_dir, exist_ok=True)
+        log(f"Output prefix: {output_file} (task summaries in {save_dir}/)")
+
+        # Load tasks per domain (domain-specific loaders via registry)
+        tasks_by_domain: Dict[str, List[Any]] = {}
+        total_tasks = 0
+        for d in domains:
+            tpath = task_paths[d]
+            tasks = get_tasks(task_set_name=d, task_ids=None, num_tasks=num_tasks, task_path=tpath, save_to=output_file)
+            tasks_by_domain[d] = tasks
+            total_tasks += len(tasks) * num_trials
+            log(f"Loaded tasks: domain={d} tasks={len(tasks)} trials={num_trials} path={tpath}")
+        if total_tasks <= 0:
+            log("ERROR: No tasks to run after loading (check task files / num-tasks).")
+            return 2
+
+        # Build a global schedule in round-robin order.
+        items = _round_robin_items(tasks_by_domain, domains, num_trials=num_trials, trial_seeds=trial_seeds)
+        assert len(items) == total_tasks, f"internal error: scheduled={len(items)} total={total_tasks}"
+
+        log(f"Scheduling mode: global (round-robin) total_tasks={total_tasks} max_concurrency={max_concurrency}")
+
+        start_ts = time.time()
+        completed = 0
+        ok = 0
+        err = 0
+
+        lock = threading.Lock()
+
+        def _run_one(item: Tuple[str, Any, int, int]) -> Tuple[str, str, int, str, Optional[float]]:
+            domain, task, trial, trial_seed = item
+            task_id = getattr(task, "id", "unknown")
+            # Include domain in the visible task id for logs (single global log file).
+            set_task_context(f"{domain}:{task_id}", domain)
+            status = "ok"
+            reward_val: Optional[float] = None
+            try:
+                sim = run_task(
+                    domain=domain,
+                    task=task,
+                    agent="llm_agent",
+                    user="user_simulator",
+                    llm_agent=agent_llm,
+                    llm_args_agent=dict(DEFAULT_LLM_ARGS_AGENT),
+                    llm_user=user_llm,
+                    llm_args_user=dict(DEFAULT_LLM_ARGS_USER),
+                    max_steps=max_steps,
+                    max_errors=max_errors,
+                    evaluation_type=EvaluationType.ALL,
+                    seed=trial_seed,
+                    cur_transfer_dir="",
+                    model_config_path=model_config_path,
+                    use_model_tool=use_model_tool,
+                )
+                if sim is not None and getattr(sim, "reward_info", None) is not None:
+                    try:
+                        reward_val = float(sim.reward_info.reward)  # type: ignore[attr-defined]
+                    except Exception:
+                        reward_val = None
+            except Exception as e:
+                status = "error"
+                log(f"Task failed: domain={domain} task_id={task_id} trial={trial} error={e}")
+            finally:
+                clear_task_context()
+            return domain, str(task_id), trial, status, reward_val
+
+        # Submit tasks incrementally to enforce global max_concurrency without huge future queues.
+        it: Iterator[Tuple[str, Any, int, int]] = iter(items)
+        in_flight: Dict[Future, Tuple[str, Any, int, int]] = {}
+
+        with ThreadPoolExecutor(max_workers=max_concurrency) as ex:
+            # Prime the pool
+            for _ in range(max_concurrency):
+                try:
+                    item = next(it)
+                except StopIteration:
+                    break
+                in_flight[ex.submit(_run_one, item)] = item
+
+            while in_flight:
+                done_set, _pending = wait(set(in_flight.keys()), return_when=FIRST_COMPLETED)
+                for done_future in done_set:
+                    item = in_flight.pop(done_future)
+                    domain, task, trial, _trial_seed = item
+                    task_id = getattr(task, "id", "unknown")
+
+                    status = "error"
+                    reward_val: Optional[float] = None
+                    try:
+                        _d, _tid, _tr, status, reward_val = done_future.result()
+                    except Exception as e:
+                        status = "error"
+                        log(f"Task future raised: domain={domain} task_id={task_id} trial={trial} error={e}")
+
+                    with lock:
+                        completed += 1
+                        if status == "ok":
+                            ok += 1
+                        else:
+                            err += 1
+
+                        _emit_task_complete_marker(
+                            domain=domain,
+                            trial=trial,
+                            task_id=str(task_id),
+                            status=status,
+                            completed_global=completed,
+                            total_global=total_tasks,
+                        )
+
+                    # Write per-task summary (single directory, not per-domain)
+                    out_name = f"{_safe_filename(domain)}__{_safe_filename(str(task_id))}__trial{trial}.json"
+                    out_path = os.path.join(save_dir, out_name)
+                    try:
+                        with open(out_path, "w", encoding="utf-8") as f:
+                            json.dump(
+                                {
+                                    "domain": domain,
+                                    "task_id": str(task_id),
+                                    "trial": int(trial),
+                                    "status": status,
+                                    "reward": reward_val,
+                                },
+                                f,
+                                indent=2,
+                            )
+                    except Exception:
+                        pass
+
+                    # Refill one task per completion
+                    try:
+                        next_item = next(it)
+                        in_flight[ex.submit(_run_one, next_item)] = next_item
+                    except StopIteration:
+                        pass
+
+        elapsed_s = max(0.001, time.time() - start_ts)
+        tasks_per_min = ok / (elapsed_s / 60.0)
+        log(f"Global evaluation complete: ok={ok} error={err} total={total_tasks} elapsed_s={elapsed_s:.1f} tasks_per_min={tasks_per_min:.2f}")
+
+        # Persist a small summary for downstream scripts.
+        try:
+            with open(os.path.join(output_dir, "metrics_global.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "domains": domains,
+                        "total": total_tasks,
+                        "ok": ok,
+                        "error": err,
+                        "elapsed_s": elapsed_s,
+                        "tasks_per_min": tasks_per_min,
+                        "log_dir": log_dir,
+                        "tau2_log": tau2_log_path,
+                        "eval_log": eval_log_path,
+                    },
+                    f,
+                    indent=2,
+                )
+        except Exception:
+            pass
+
+        return 0 if err == 0 else 1
+    finally:
+        _close_driver_log()
 
 # ============================================================================
 # Model Configuration
@@ -538,8 +848,6 @@ def run_evaluation(
     if use_model_tool:
         cmd.append("--use_model_tool")
 
-    log(f"Running command: {' '.join(cmd)}")
-
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
@@ -547,6 +855,8 @@ def run_evaluation(
     env["TAU2_LOG_FILE"] = os.path.join(log_dir, f"tau2_{domain}.log")
 
     eval_log_path = os.path.join(log_dir, f"eval_{domain}.log")
+    log(f"Running command: {' '.join(cmd)}")
+    log(f"Next logs: eval_log={eval_log_path} tau2_log={env['TAU2_LOG_FILE']}")
 
     def _fmt_hms(seconds: float) -> str:
         if seconds < 0:
@@ -799,6 +1109,14 @@ Example usage:
         help="Skip starting servers (use existing)"
     )
 
+    parser.add_argument(
+        "--schedule-mode",
+        type=str,
+        choices=["per-domain", "global"],
+        default="per-domain",
+        help="Scheduling mode: per-domain (legacy, domain-by-domain) or global (cross-domain global max-concurrency). Default: per-domain.",
+    )
+
     args = parser.parse_args()
 
     # Validate
@@ -919,54 +1237,74 @@ Example usage:
             log(f"ERROR: Task file not found: {task_paths[domain]}")
             sys.exit(1)
 
-    # Count total tasks
-    def _count_tasks(path: str) -> int:
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                return len(data)
-            if isinstance(data, dict) and "tasks" in data:
-                return len(data["tasks"])
-        except Exception:
-            pass
-        return 0
-
-    overall_total = 0
-    for domain in args.domains:
-        n = _count_tasks(task_paths[domain])
-        if args.num_tasks is not None:
-            n = min(n, args.num_tasks)
-        overall_total += n * args.num_trials
-
-    overall_state = {
-        "total": overall_total,
-        "done": 0,
-        "start_ts": time.time(),
-    }
-
     results = {}
-    for domain in args.domains:
-        output_file = os.path.join(args.output_dir, f"{domain}.json")
-
-        returncode = run_evaluation(
-            domain=domain,
+    if args.schedule_mode == "global":
+        log("Scheduling mode: global (cross-domain)")
+        rc = run_global_evaluation(
+            domains=list(args.domains),
             agent_llm=args.agent_model,
             user_llm=args.user_llm,
-            task_path=task_paths[domain],
-            output_file=output_file,
+            task_paths=task_paths,
             model_config_path=args.model_config_path,
+            output_dir=args.output_dir,
+            log_dir=args.log_dir,
             max_steps=args.max_steps,
             num_trials=args.num_trials,
-            use_model_tool=args.use_model_tool,
-            max_concurrency=args.max_concurrency,
             num_tasks=args.num_tasks,
+            max_concurrency=args.max_concurrency,
+            use_model_tool=args.use_model_tool,
             log_level=args.log_level,
-            log_dir=args.log_dir,
-            overall_state=overall_state,
         )
+        results["global"] = "SUCCESS" if rc == 0 else "FAILED"
+    else:
+        # Legacy mode: run one domain at a time (each domain internally uses --max-concurrency)
+        # Count total tasks for overall ETA based on [TAU2_TASK_COMPLETE] markers.
+        def _count_tasks(path: str) -> int:
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return len(data)
+                if isinstance(data, dict) and "tasks" in data:
+                    return len(data["tasks"])
+            except Exception:
+                pass
+            return 0
 
-        results[domain] = "SUCCESS" if returncode == 0 else "FAILED"
+        overall_total = 0
+        for domain in args.domains:
+            n = _count_tasks(task_paths[domain])
+            if args.num_tasks is not None:
+                n = min(n, args.num_tasks)
+            overall_total += n * args.num_trials
+
+        overall_state = {
+            "total": overall_total,
+            "done": 0,
+            "start_ts": time.time(),
+        }
+
+        for domain in args.domains:
+            output_file = os.path.join(args.output_dir, f"{domain}.json")
+
+            returncode = run_evaluation(
+                domain=domain,
+                agent_llm=args.agent_model,
+                user_llm=args.user_llm,
+                task_path=task_paths[domain],
+                output_file=output_file,
+                model_config_path=args.model_config_path,
+                max_steps=args.max_steps,
+                num_trials=args.num_trials,
+                use_model_tool=args.use_model_tool,
+                max_concurrency=args.max_concurrency,
+                num_tasks=args.num_tasks,
+                log_level=args.log_level,
+                log_dir=args.log_dir,
+                overall_state=overall_state,
+            )
+
+            results[domain] = "SUCCESS" if returncode == 0 else "FAILED"
 
     # Print summary
     log("\n" + "=" * 60)
@@ -977,11 +1315,15 @@ Example usage:
     log(f"Expert-3: Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 (MTP 4 tokens)")
     log("-" * 60)
     for domain, status in results.items():
-        log(f"{domain.upper()}: {status}")
+        log(f"{str(domain).upper()}: {status}")
     log("=" * 60)
     log(f"Output directory: {args.output_dir}")
     log(f"Log directory: {args.log_dir}")
-    log(f"Profile logs: {args.log_dir}/tau2_*.log")
+    if args.schedule_mode == "global":
+        log(f"Profile logs: {args.log_dir}/tau2_global.log")
+        log(f"Driver logs: {args.log_dir}/eval_global.log")
+    else:
+        log(f"Profile logs: {args.log_dir}/tau2_*.log")
 
 
 if __name__ == "__main__":

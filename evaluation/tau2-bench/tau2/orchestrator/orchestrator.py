@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Optional
 import os
+import requests
 from loguru import logger
 
 from tau2.utils.logging_config import (
@@ -87,6 +88,35 @@ class Orchestrator:
         self.from_role: Optional[Role] = None
         self.to_role: Optional[Role] = None
         self.message: Optional[Message] = None
+        # ThunderReact / router integration
+        self.job_id = f"tau2:{domain}:{task.id}:{uuid.uuid4().hex[:8]}"
+        self.router_released = False
+
+    @staticmethod
+    def _set_llm_router_args(target: Any, job_id: str, is_last_step: bool) -> None:
+        """Set job_id and is_last_step on target's llm_args dict (if present)."""
+        llm_args = getattr(target, "llm_args", None)
+        if isinstance(llm_args, dict):
+            llm_args["job_id"] = job_id
+            llm_args["is_last_step"] = is_last_step
+
+    def _release_router_job(self) -> None:
+        """Release job from ThunderReact router when task completes."""
+        if self.router_released:
+            return
+        router_url = os.getenv("ROUTER_URL")
+        if not router_url:
+            return
+        try:
+            resp = requests.post(
+                f"{router_url.rstrip('/')}/programs/release",
+                json={"job_id": self.job_id},
+                timeout=2.0,
+            )
+            resp.raise_for_status()
+            self.router_released = True
+        except Exception as exc:
+            logger.warning(f"Failed to release job_id={self.job_id}: {exc}")
 
     def initialize(self):
         """
@@ -278,47 +308,50 @@ class Orchestrator:
         Returns:
             SimulationRun: The simulation run.
         """
-        tau2_logger = get_tau2_logger()
-        start_time = get_now()
-        start = time.perf_counter()
-        tau2_logger.debug(f"Starting simulation run for task={self.task.id}")
-        self.initialize()
-        tau2_logger.debug(
-            f"Simulation initialized for task={self.task.id} from={self.from_role} to={self.to_role} done={self.done}"
-        )
-        while not self.done:
-            # with open(os.path.join(self.cur_transfer_dir,f"tau_loop_{self.step_count}"),'w') as f:
-            #     f.write(f"263, tau self.step_count, {self.step_count}")
-            # print(263,'Step',self.step_count)
-            self.step()
-            if self.step_count >= self.max_steps:
-                self.done = True
-                self.termination_reason = TerminationReason.MAX_STEPS
-            if self.num_errors >= self.max_errors:
-                self.done = True
-                self.termination_reason = TerminationReason.TOO_MANY_ERRORS
-        # print(279,'finish all steps')
-        duration = time.perf_counter() - start
-        messages = self.get_trajectory()
-        res = get_cost(messages)
-        if res is None:
-            agent_cost, user_cost = None, None
-        else:
-            agent_cost, user_cost = res
-        simulation_run = SimulationRun(
-            id=str(uuid.uuid4()),
-            task_id=self.task.id,
-            start_time=start_time,
-            end_time=get_now(),
-            duration=duration,
-            termination_reason=self.termination_reason.value,
-            reward_info=None,
-            user_cost=user_cost,
-            agent_cost=agent_cost,
-            messages=messages,
-            seed=self.seed,
-        )
-        return simulation_run
+        try:
+            tau2_logger = get_tau2_logger()
+            start_time = get_now()
+            start = time.perf_counter()
+            tau2_logger.debug(f"Starting simulation run for task={self.task.id}")
+            self.initialize()
+            tau2_logger.debug(
+                f"Simulation initialized for task={self.task.id} from={self.from_role} to={self.to_role} done={self.done}"
+            )
+            while not self.done:
+                # with open(os.path.join(self.cur_transfer_dir,f"tau_loop_{self.step_count}"),'w') as f:
+                #     f.write(f"263, tau self.step_count, {self.step_count}")
+                # print(263,'Step',self.step_count)
+                self.step()
+                if self.step_count >= self.max_steps:
+                    self.done = True
+                    self.termination_reason = TerminationReason.MAX_STEPS
+                if self.num_errors >= self.max_errors:
+                    self.done = True
+                    self.termination_reason = TerminationReason.TOO_MANY_ERRORS
+            # print(279,'finish all steps')
+            duration = time.perf_counter() - start
+            messages = self.get_trajectory()
+            res = get_cost(messages)
+            if res is None:
+                agent_cost, user_cost = None, None
+            else:
+                agent_cost, user_cost = res
+            simulation_run = SimulationRun(
+                id=str(uuid.uuid4()),
+                task_id=self.task.id,
+                start_time=start_time,
+                end_time=get_now(),
+                duration=duration,
+                termination_reason=self.termination_reason.value,
+                reward_info=None,
+                user_cost=user_cost,
+                agent_cost=agent_cost,
+                messages=messages,
+                seed=self.seed,
+            )
+            return simulation_run
+        finally:
+            self._release_router_job()
 
     def step(self):
         """
@@ -350,6 +383,7 @@ class Orchestrator:
             tau2_logger.debug(
                 f"Calling user.generate_next_message step={self.step_count} task={self.task.id}"
             )
+            self._set_llm_router_args(self.user, self.job_id, False)
             user_msg, self.user_state = self.user.generate_next_message(
                 self.message, self.user_state
             )
@@ -372,6 +406,7 @@ class Orchestrator:
             tau2_logger.debug(
                 f"Calling agent.generate_next_message step={self.step_count} task={self.task.id}"
             )
+            self._set_llm_router_args(self.agent, self.job_id, False)
             agent_msg, self.agent_state = self.agent.generate_next_message(
                 self.message, self.agent_state
             )

@@ -1,29 +1,79 @@
 {
   "/home/junxiong/haokang/ckpt/nvidia/Nemotron-Orchestrator-8B/": [
-    {"ip_addr": "research-secure-12", "port": "1900"},
-    {"ip_addr": "research-secure-12", "port": "1901"},
-    {"ip_addr": "research-secure-12", "port": "1902"},
-    {"ip_addr": "research-secure-12", "port": "1903"}
+    {
+      "ip_addr": "172.27.25.244",
+      "port": "1900"
+    },
+    {
+      "ip_addr": "172.27.25.244",
+      "port": "1901"
+    },
+    {
+      "ip_addr": "172.27.25.244",
+      "port": "1902"
+    },
+    {
+      "ip_addr": "172.27.25.244",
+      "port": "1903"
+    }
   ],
-  "Qwen/Qwen3-Next-80B-A3B-Instruct": [
-    {"ip_addr": "research-secure-11", "port": "1904"}
-  ],
-  "openai/gpt-oss-120b": [
-    {"ip_addr": "research-secure-05", "port": "1910"},
-    {"ip_addr": "research-secure-05", "port": "1911"},
-    {"ip_addr": "research-secure-05", "port": "1912"},
-    {"ip_addr": "research-secure-05", "port": "1913"}
+  "Qwen/Qwen3-32B-FP8": [
+    {
+      "ip_addr": "172.27.25.244",
+      "port": "1904"
+    },
+    {
+      "ip_addr": "172.27.25.244",
+      "port": "1905"
+    },
+    {
+      "ip_addr": "172.27.25.244",
+      "port": "1906"
+    },
+    {
+      "ip_addr": "172.27.25.244",
+      "port": "1907"
+    }
   ],
   "openai/gpt-oss-20b": [
-    {"ip_addr": "research-secure-13", "port": "1914"},
-    {"ip_addr": "research-secure-13", "port": "1915"},
-    {"ip_addr": "research-secure-13", "port": "1916"},
-    {"ip_addr": "research-secure-13", "port": "1917"}
+    {
+      "ip_addr": "172.27.20.172",
+      "port": "1910"
+    },
+    {
+      "ip_addr": "172.27.20.172",
+      "port": "1911"
+    },
+    {
+      "ip_addr": "172.27.20.172",
+      "port": "1912"
+    },
+    {
+      "ip_addr": "172.27.20.172",
+      "port": "1913"
+    }
   ],
-  "vllm_model_config_path": "model_config_oss.json",
+  "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8": [
+    {
+      "ip_addr": "172.27.25.31",
+      "port": "1920"
+    },
+    {
+      "ip_addr": "172.27.25.31",
+      "port": "1921"
+    },
+    {
+      "ip_addr": "172.27.25.31",
+      "port": "1922"
+    },
+    {
+      "ip_addr": "172.27.25.31",
+      "port": "1923"
+    }
+  ],
   "oss_expert_mapping": {
-    "expert-1": "openai/gpt-oss-120b",
-    "expert-2": "openai/gpt-oss-20b",
-    "expert-3": "Qwen/Qwen3-Next-80B-A3B-Instruct"
+    "expert-1": "openai/gpt-oss-20b",
+    "expert-2": "Qwen/Qwen3-32B-FP8",
+    "expert-3": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
   }
 }

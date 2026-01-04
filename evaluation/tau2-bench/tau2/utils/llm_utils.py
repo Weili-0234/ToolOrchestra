@@ -121,6 +121,11 @@ TOOL_PRICING = {
     },
 }
 
+_DEFAULT_PRICING = {
+    "input_tokens_per_million": 0.0,
+    "output_tokens_per_million": 0.0,
+}
+
 MODEL_TYPE = "Qwen/Qwen3-8B"
 
 POLICY_STRINGS = [
@@ -457,8 +462,22 @@ def generate(
 
     Returns: A tuple containing the message and the cost.
     """
-    if role!='user' and role!='assistant' and role!='evaluator':
-        raise ValueError(f'unknown role {role}')
+    # Backwards compatibility: some call sites historically didn't pass role.
+    if role is None:
+        role = "assistant"
+    if role != "user" and role != "assistant" and role != "evaluator":
+        raise ValueError(f"unknown role {role}")
+
+    # Router / scheduler fields (ThunderReact / Continuum)
+    job_id = kwargs.pop("job_id", None)
+    is_last_step = kwargs.pop("is_last_step", False)
+    last_func_call = kwargs.pop("last_func_call", None)
+    extra_body: dict[str, Any] = {}
+    if job_id:
+        extra_body["job_id"] = job_id
+        extra_body["is_last_step"] = bool(is_last_step)
+    if last_func_call is not None:
+        extra_body["last_func_call"] = last_func_call
     
     tau2_logger = get_tau2_logger()
     llm_timer = Timer()
@@ -477,8 +496,8 @@ def generate(
 
     if model.startswith("claude") and not ALLOW_SONNET_THINKING:
         kwargs["thinking"] = {"type": "disabled"}
-    if role=='assistant':
-        assert domain
+    if role == "assistant" and not domain:
+        domain = "unknown"
     litellm_messages = to_litellm_messages(messages,model=model,use_model_tool=use_model_tool,domain=domain,role=role)
     tools = [tool.openai_schema for tool in tools] if tools else None
     if tools and tool_choice is None:
@@ -486,6 +505,44 @@ def generate(
     original_tools = copy.deepcopy(tools)
     start_time = time.time()
     cost = 0
+
+    # Streaming profiling toggles:
+    #
+    # - We used streaming mainly to estimate TTFT/prefill and decode time for vLLM models.
+    # - However, streaming can introduce compatibility issues across OSS backends (e.g. fields
+    #   emitted under reasoning_content vs content), and increases complexity.
+    #
+    # Policy:
+    # - Expert LLM calls: streaming is OFF by default.
+    # - Orchestrator-8B calls: streaming is OFF by default, but can be enabled via env.
+    #
+    # Enable by setting:
+    #   - TAU2_TOOLORCH_STREAM_PROFILE=1   (orchestrator only)
+    #   - TAU2_EXPERT_STREAM_PROFILE=1     (experts; default 0)
+    _TOOLORCH_STREAM_PROFILE = os.getenv("TAU2_TOOLORCH_STREAM_PROFILE", "0") == "1"
+    _EXPERT_STREAM_PROFILE = os.getenv("TAU2_EXPERT_STREAM_PROFILE", "0") == "1"
+
+    def _extract_message_text(msg: Any) -> str:
+        """
+        Best-effort extraction of assistant text from OpenAI-compatible responses.
+        Some OSS models served by vLLM may populate `reasoning_content`/`reasoning`
+        while leaving `content` as None.
+        """
+        val = getattr(msg, "content", None)
+        if val is None or val == "" or val == []:
+            val = getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None)
+        # Handle potential list-of-parts content formats.
+        if isinstance(val, list):
+            parts: list[str] = []
+            for p in val:
+                if isinstance(p, dict) and isinstance(p.get("text"), str):
+                    parts.append(p["text"])
+                else:
+                    parts.append(str(p))
+            val = "".join(parts)
+        if val is None:
+            return ""
+        return str(val)
     
     # Determine call type for logging
     call_type = "unknown"
@@ -517,7 +574,8 @@ def generate(
         # Time only the main ToolOrchestra vLLM model inference (Nemotron-Orchestrator-8B).
         # If log-level is PROFILE/DEBUG, enable streaming profiling to capture TTFT (prefill) + decode time.
         is_toolorchestra_main_vllm = ("orchestrator" in model.lower() and "8b" in model.lower())
-        stream_profile = bool(is_toolorchestra_main_vllm and tau2_logger.isEnabledFor(PROFILE))
+        # Default OFF; enable explicitly via TAU2_TOOLORCH_STREAM_PROFILE=1.
+        stream_profile = bool(is_toolorchestra_main_vllm and _TOOLORCH_STREAM_PROFILE and tau2_logger.isEnabledFor(PROFILE))
         if is_toolorchestra_main_vllm:
             _infer_timer = Timer()
             _infer_timer.__enter__()
@@ -534,6 +592,7 @@ def generate(
                     model_type='vllm',
                     max_length=8000,
                     tau2_stream_profile=stream_profile,
+                    extra_body=extra_body if extra_body else None,
                 )
             finally:
                 _infer_timer.__exit__(None, None, None)
@@ -558,6 +617,7 @@ def generate(
                 model_config_idx=config_idx,
                 model_type='vllm',
                 max_length=8000,
+                extra_body=extra_body if extra_body else None,
             )
         mode_to_call = None
         tool_calls = []
@@ -570,9 +630,10 @@ def generate(
         if isinstance(response,str):
             response_content = "Wait a minute, I will take it very soon"
         else:
-            if response.choices[0].message.content:
-                response_content = response.choices[0].message.content.split('</think>')[-1].strip()
-                raw_response = response.choices[0].message.content
+            msg = response.choices[0].message
+            raw_response = _extract_message_text(msg)
+            if raw_response:
+                response_content = raw_response.split('</think>')[-1].strip()
             else:
                 response_content = ''
                 raw_response = ''
@@ -582,7 +643,11 @@ def generate(
                 raw_tool_calls = []
             input_tokens = response.usage.prompt_tokens
             output_tokens = response.usage.completion_tokens
-            cost += (response.usage.prompt_tokens * TOOL_PRICING[MODEL_TYPE]["input_tokens_per_million"] + response.usage.completion_tokens * TOOL_PRICING[MODEL_TYPE]["output_tokens_per_million"])
+            pricing = TOOL_PRICING.get(MODEL_TYPE, _DEFAULT_PRICING)
+            cost += (
+                response.usage.prompt_tokens * pricing["input_tokens_per_million"]
+                + response.usage.completion_tokens * pricing["output_tokens_per_million"]
+            )
         if response_content is not None and isinstance(response_content,str) and len(response_content)>5 and '<message>' in response_content and '</message>' in response_content:
             response_content = response_content.split('<message>')[-1].split('</message>')[0]
         if not isinstance(response,str) and response.choices[0].message.tool_calls:
@@ -640,11 +705,12 @@ def generate(
 
             if is_openai_api:
                 # Proprietary OpenAI models (gpt-5, gpt-5-mini)
-                response = get_llm_response(model=mode_to_call,messages=llm_messages,tools=original_tools,return_raw_response=True,max_length=40000)
+                response = get_llm_response(model=mode_to_call,messages=llm_messages,tools=original_tools,return_raw_response=True,max_length=40000,extra_body=extra_body if extra_body else None)
             elif is_vllm_oss:
                 # OSS models via local vLLM (gpt-oss-*, qwen3-*, qwen3-next-*)
-                # Enable streaming profiling to capture prefill/decode times
-                expert_stream_profile = tau2_logger.isEnabledFor(PROFILE)
+                # Default OFF; enable explicitly via TAU2_EXPERT_STREAM_PROFILE=1.
+                # (Most evaluations don't require TTFT breakdown for experts, and streaming can be flaky.)
+                expert_stream_profile = bool(_EXPERT_STREAM_PROFILE and tau2_logger.isEnabledFor(PROFILE))
                 with open(model_config_path) as f:
                     model_config = json.load(f)[mode_to_call]
                 tools_length = len(tokenizer(str(original_tools))['input_ids'])
@@ -660,6 +726,7 @@ def generate(
                     model_type='vllm',
                     max_length=8000,
                     tau2_stream_profile=expert_stream_profile,
+                    extra_body=extra_body if extra_body else None,
                 )
                 # Extract streaming profiling data if available
                 if not isinstance(response, str):
@@ -687,10 +754,14 @@ def generate(
             if isinstance(response,str):
                 response_content = "Wait a minute, I will take it very soon"
             else:
-                response_content = response.choices[0].message.content
+                response_content = _extract_message_text(response.choices[0].message)
                 expert_input_tokens = response.usage.prompt_tokens
                 expert_output_tokens = response.usage.completion_tokens
-                cost += (response.usage.prompt_tokens * TOOL_PRICING[mode_to_call]["input_tokens_per_million"] + response.usage.completion_tokens * TOOL_PRICING[mode_to_call]["output_tokens_per_million"])
+                pricing = TOOL_PRICING.get(mode_to_call, _DEFAULT_PRICING)
+                cost += (
+                    response.usage.prompt_tokens * pricing["input_tokens_per_million"]
+                    + response.usage.completion_tokens * pricing["output_tokens_per_million"]
+                )
             tool_calls = []
             if not isinstance(response,str) and response.choices[0].message.tool_calls:
                 for one_tool_call in response.choices[0].message.tool_calls:
@@ -705,7 +776,8 @@ def generate(
             'tool_calls': tool_calls,
         }
     elif 'claude' in model.lower():
-        response = get_llm_response(model=model,messages=litellm_messages,tools=tools,return_raw_response=True,max_length=40000)
+        response = get_llm_response(model=model,messages=litellm_messages,tools=tools,return_raw_response=True,max_length=40000,extra_body=extra_body if extra_body else None)
+        response = get_llm_response(model=model,messages=litellm_messages,tools=tools,return_raw_response=True,max_length=40000,extra_body=extra_body if extra_body else None)
         tool_calls = []
         response_content = ""
         input_tokens = 0
@@ -723,7 +795,11 @@ def generate(
                     raise ValueError(f"Unknown type: {return_result['type']}")
             input_tokens = response['usage']['input_tokens']
             output_tokens = response['usage']['output_tokens']
-            cost += (input_tokens * TOOL_PRICING[model]["input_tokens_per_million"] + output_tokens * TOOL_PRICING[model]["output_tokens_per_million"])
+            pricing = TOOL_PRICING.get(model, _DEFAULT_PRICING)
+            cost += (
+                input_tokens * pricing["input_tokens_per_million"]
+                + output_tokens * pricing["output_tokens_per_million"]
+            )
         if not response_content and not tool_calls:
             response_content = "Wait a minute, I will take it very soon"
         response = {
@@ -739,7 +815,14 @@ def generate(
                 )
         except Exception:
             pass
-        response = get_llm_response(model=model,messages=litellm_messages,tools=tools,return_raw_response=True,max_length=40000)
+        response = get_llm_response(
+            model=model,
+            messages=litellm_messages,
+            tools=tools,
+            return_raw_response=True,
+            max_length=40000,
+            extra_body=extra_body if extra_body else None,
+        )
         tool_calls = []
         if not isinstance(response,str) and response.choices[0].message.tool_calls:
             for one_tool_call in response.choices[0].message.tool_calls:
@@ -752,13 +835,17 @@ def generate(
         if isinstance(response,str) or not response:
             response_content = "Wait a minute, I will take it very soon"
         else:
-            response_content = response.choices[0].message.content
+            response_content = _extract_message_text(response.choices[0].message)
             if role=='assistant' and isinstance(response_content,str):
                 response_content = response_content.split('</think>')[-1]
             input_tokens = response.usage.prompt_tokens
             output_tokens = response.usage.completion_tokens
-            if role=='assistant':
-                cost += (response.usage.prompt_tokens * TOOL_PRICING[model]["input_tokens_per_million"] + response.usage.completion_tokens * TOOL_PRICING[model]["output_tokens_per_million"])
+            if role == "assistant":
+                pricing = TOOL_PRICING.get(model, _DEFAULT_PRICING)
+                cost += (
+                    response.usage.prompt_tokens * pricing["input_tokens_per_million"]
+                    + response.usage.completion_tokens * pricing["output_tokens_per_million"]
+                )
         if not response_content and not tool_calls:
             response_content = "Wait a minute, I will take it very soon"
         response = {

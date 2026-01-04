@@ -228,9 +228,20 @@ def run_tasks(
     """
     if isinstance(save_to, str):
         save_to = Path(save_to)
-    save_dir = str(save_to)
-    assert save_dir.endswith('.json')
-    save_dir = save_dir[:-len('.json')]
+    # save_to is optional for tests / quick runs. When unset, disable on-disk checkpointing.
+    # We also accept a directory path (e.g. ".") for backwards-compatible callers.
+    save_dir: Optional[str]
+    if save_to is None:
+        save_dir = None
+    else:
+        # Directory path -> no checkpointing; just use it as an output dir if needed.
+        if isinstance(save_to, Path) and save_to.suffix != ".json":
+            save_dir = str(save_to)
+            save_to = None
+        else:
+            save_dir = str(save_to)
+            assert save_dir.endswith(".json")
+            save_dir = save_dir[: -len(".json")]
     # updated_tasks = []
 
     # Configure tau2 logging with the specified level.
@@ -286,7 +297,7 @@ def run_tasks(
         simulations=[],
     )
     done_runs = set()
-    if not os.path.isdir(save_dir):
+    if save_dir is not None and not os.path.isdir(save_dir):
         os.makedirs(save_dir)
     if save_to is not None:
         # If save_to already exists, check if the user wants to resume the run.
@@ -299,7 +310,7 @@ def run_tasks(
 
     def _save(simulation: SimulationRun,latency):
         # print(268,'save')
-        if save_to is None:
+        if save_to is None or save_dir is None:
             return
         cur_simulation = simulation.model_dump()
         with open(os.path.join(save_dir,cur_simulation['id']+'.json'),'w') as f:

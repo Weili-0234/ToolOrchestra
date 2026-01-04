@@ -321,6 +321,12 @@ def get_openai_client(model):
 def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,tools=None,show_messages=False,model_type=None,max_length=1024,model_config=None,model_config_idx=0,model_config_path=None,payload=None,**kwargs):
     if isinstance(messages,str):
         messages = [{'role': 'user','content': messages}]
+    # Compatibility aliases: some older configs/tests still reference legacy model names.
+    MODEL_ALIASES = {
+        "gpt-3.5-turbo": "gpt-4o-mini",
+        "gpt-4-turbo": "gpt-4o-mini",
+    }
+    model = MODEL_ALIASES.get(model, model)
     req_id = str(uuid.uuid4())
     _llm_log({
         "event": "enter",
@@ -600,6 +606,18 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                             if delta_content:
                                 _mark_first_token()
                                 content_parts.append(delta_content)
+
+                            # Some OSS models (e.g., gpt-oss-*) served by vLLM stream tokens under
+                            # `delta.reasoning_content` / `delta.reasoning` while leaving `delta.content` empty.
+                            # For tau2-bench we treat these as "content" so callers don't see empty strings.
+                            delta_reasoning_content = getattr(delta, "reasoning_content", None)
+                            delta_reasoning = getattr(delta, "reasoning", None)
+                            if delta_reasoning_content:
+                                _mark_first_token()
+                                content_parts.append(delta_reasoning_content)
+                            elif delta_reasoning:
+                                _mark_first_token()
+                                content_parts.append(delta_reasoning)
 
                             delta_tool_calls = getattr(delta, "tool_calls", None)
                             if delta_tool_calls:

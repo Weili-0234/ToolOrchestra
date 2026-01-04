@@ -14,6 +14,8 @@ from tau2.orchestrator.orchestrator import (
 )
 from tau2.user.user_simulator import DummyUser, UserSimulator
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.fixture
 def user_simulator() -> UserSimulator:
@@ -41,6 +43,7 @@ def agent(get_environment: Callable[[], Environment]) -> LLMAgent:
         domain_policy=environment.get_policy(),
         llm="gpt-3.5-turbo",
         llm_args={"temperature": 0.0},
+        domain="mock",
     )
 
 
@@ -321,6 +324,10 @@ def test_orchestrator_restart(
 
     ## Step each orchestrator 3 times
     for _ in range(3):
+        # When running against real LLMs, the simulation may terminate early (e.g. transfer/stop).
+        # In that case, stepping further should not be required for this restart consistency test.
+        if orchestrator1.done or orchestrator2.done:
+            break
         orchestrator1.step()
         orchestrator2.step()
         print("--------------------------------")

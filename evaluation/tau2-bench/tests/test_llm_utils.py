@@ -10,6 +10,8 @@ from tau2.data_model.message import (
 from tau2.environment.tool import Tool, as_tool
 from tau2.utils.llm_utils import generate
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.fixture
 def model() -> str:
@@ -52,13 +54,19 @@ def tool_call_messages() -> list[Message]:
 
 
 def test_generate_no_tool_call(model: str, messages: list[Message]):
-    response = generate(model, messages)
+    response = generate(model, messages, role="assistant", domain="mock")
     assert isinstance(response, AssistantMessage)
     assert response.content is not None
 
 
 def test_generate_tool_call(model: str, tool_call_messages: list[Message], tool: Tool):
-    response = generate(model, tool_call_messages, tools=[tool])
+    response = generate(
+        model,
+        tool_call_messages,
+        tools=[tool],
+        role="assistant",
+        domain="mock",
+    )
     assert isinstance(response, AssistantMessage)
     assert len(response.tool_calls) == 1
     assert response.tool_calls[0].name == "calculate_square"
@@ -71,6 +79,8 @@ def test_generate_tool_call(model: str, tool_call_messages: list[Message], tool:
         model,
         tool_call_messages + follow_up_messages,
         tools=[tool],
+        role="assistant",
+        domain="mock",
     )
     assert isinstance(response, AssistantMessage)
     assert response.tool_calls is None

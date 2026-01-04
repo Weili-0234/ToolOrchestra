@@ -1,0 +1,52 @@
+{
+  "/home/junxiong/haokang/ckpt/nvidia/Nemotron-Orchestrator-8B/": [
+    {
+      "ip_addr": "172.27.18.27",
+      "port": "8000"
+    }
+  ],
+  "openai/gpt-oss-20b": [
+    {
+      "ip_addr": "172.27.27.153",
+      "port": "1910"
+    },
+    {
+      "ip_addr": "172.27.27.153",
+      "port": "1911"
+    },
+    {
+      "ip_addr": "172.27.27.153",
+      "port": "1912"
+    },
+    {
+      "ip_addr": "172.27.27.153",
+      "port": "1913"
+    }
+  ],
+  "Qwen/Qwen3-32B-FP8": [
+    {
+      "ip_addr": "172.27.25.244",
+      "port": "1904"
+    },
+    {
+      "ip_addr": "172.27.25.244",
+      "port": "1905"
+    }
+  ],
+  "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8": [
+    {
+      "ip_addr": "172.27.19.213",
+      "port": "1920"
+    },
+    {
+      "ip_addr": "172.27.19.213",
+      "port": "1921"
+    }
+  ],
+  "vllm_model_config_path": "evaluation/tau2-bench/model_config_rollout.json",
+  "oss_expert_mapping": {
+    "expert-1": "openai/gpt-oss-20b",
+    "expert-2": "Qwen/Qwen3-32B-FP8",
+    "expert-3": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
+  }
+}

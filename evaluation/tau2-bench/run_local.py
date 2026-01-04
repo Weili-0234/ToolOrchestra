@@ -231,10 +231,6 @@ def run_evaluation(domain: str, agent_llm: str, user_llm: str,
     if use_model_tool:
         cmd.append("--use_model_tool")
 
-    log(f"Running command: {' '.join(cmd)}")
-    log(f"Working directory: {os.getcwd()}")
-    log(f"Checking task path: {task_path} (exists: {os.path.exists(task_path)})")
-    
     # Capture output to print progress
     env = os.environ.copy()
     # Ensure child python prints are flushed promptly (avoids "looks hung" due to buffering)
@@ -245,6 +241,11 @@ def run_evaluation(domain: str, agent_llm: str, user_llm: str,
     env["TAU2_LOG_FILE"] = os.path.join(log_dir, f"tau2_{domain}.log")
 
     eval_log_path = os.path.join(log_dir, f"eval_{domain}.log")
+    log(f"Running command: {' '.join(cmd)}")
+    log(f"Next logs: eval_log={eval_log_path} tau2_log={env['TAU2_LOG_FILE']}")
+    log(f"Working directory: {os.getcwd()}")
+    log(f"Checking task path: {task_path} (exists: {os.path.exists(task_path)})")
+    
 
     def _fmt_hms(seconds: float) -> str:
         if seconds < 0:

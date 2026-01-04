@@ -2,16 +2,14 @@
 
 import unittest
 from datetime import date
-from pathlib import Path
 
 from tau2.domains.telecom.data_model import LineStatus, TelecomDB
 from tau2.domains.telecom.tools import TelecomTools
 from tau2.domains.telecom.utils import get_now, get_today
+from tau2.utils import DATA_DIR
 
 # Path to the telecom database file
-TELECOM_DB_PATH = (
-    Path(__file__).parents[3] / "data" / "tau2" / "domains" / "telecom" / "db.toml"
-)
+TELECOM_DB_PATH = DATA_DIR / "tau2" / "domains" / "telecom" / "db.toml"
 
 
 class TestTelecomTools(unittest.TestCase):
