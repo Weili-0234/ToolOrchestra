@@ -29,6 +29,23 @@ import uuid
 import traceback
 from datetime import datetime
 
+
+# Custom exceptions for LLM call failures
+class ContextLengthExceededError(Exception):
+    """Raised when input exceeds model's context length limit."""
+    pass
+
+
+class MaxRetriesExceededError(Exception):
+    """Raised when max retry attempts are exhausted."""
+    pass
+
+
+class LLMTimeoutError(Exception):
+    """Raised when an LLM call exceeds the configured wall-time timeout."""
+    pass
+
+
 KEYS_DIR = 'keys'
 if not os.path.isdir(KEYS_DIR):
     os.makedirs(KEYS_DIR,exist_ok=True)
@@ -295,10 +312,12 @@ def get_claude_token():
     return result
 
 
-def get_openai_client(model):
+def get_openai_client(model, timeout_s: float | None = None):
     api_key = os.getenv("OPENAI_API_KEY")
     if api_key:
-        return OpenAI(api_key=api_key)
+        if timeout_s is None:
+            return OpenAI(api_key=api_key)
+        return OpenAI(api_key=api_key, timeout=timeout_s)
 
     client_id = os.getenv("CLIENT_ID")
     client_secret = os.getenv("CLIENT_SECRET")
@@ -311,11 +330,19 @@ def get_openai_client(model):
     openai.api_base = "https://prod.api.nvidia.com/llm/v1/azure/"
     openai.api_version = "2025-04-01-preview"
     openai.api_key = token
-    client = AzureOpenAI(
-        api_key=token,
-        api_version="2025-04-01-preview",
-        azure_endpoint="https://prod.api.nvidia.com/llm/v1/azure/"
-    )
+    if timeout_s is None:
+        client = AzureOpenAI(
+            api_key=token,
+            api_version="2025-04-01-preview",
+            azure_endpoint="https://prod.api.nvidia.com/llm/v1/azure/",
+        )
+    else:
+        client = AzureOpenAI(
+            api_key=token,
+            api_version="2025-04-01-preview",
+            azure_endpoint="https://prod.api.nvidia.com/llm/v1/azure/",
+            timeout=timeout_s,
+        )
     return client
 
 def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,tools=None,show_messages=False,model_type=None,max_length=1024,model_config=None,model_config_idx=0,model_config_path=None,payload=None,**kwargs):
@@ -341,6 +368,56 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
     # Optional: enable streaming for local vLLM calls so we can measure time-to-first-token (prefill)
     # and decode time. Only used by tau2 profiling.
     tau2_stream_profile = bool(kwargs.pop("tau2_stream_profile", False))
+    # Maximum number of retries for transient errors (not used for permanent errors like context length)
+    max_retries = kwargs.pop("num_retries", 5)
+    try:
+        max_retries = int(max_retries)  # type: ignore[arg-type]
+    except Exception:
+        max_retries = 5
+    if max_retries <= 0:
+        max_retries = 1
+
+    # Call-level wall-time timeout (seconds) for a single LLM request (including retries).
+    call_timeout_s = kwargs.pop("call_timeout_s", os.getenv("TOOL_ORCH_CALL_TIMEOUT_S", "600"))
+    try:
+        call_timeout_s = float(call_timeout_s)  # type: ignore[arg-type]
+    except Exception:
+        call_timeout_s = 600.0
+    if call_timeout_s <= 0:
+        # Disable if misconfigured
+        call_timeout_s = 0.0
+
+    def _get_status_code(err: Exception) -> Optional[int]:
+        """
+        Best-effort extraction of HTTP status code from OpenAI-compatible exceptions.
+        Works for both OpenAI and vLLM (OpenAI-compatible) clients.
+        """
+        status = getattr(err, "status_code", None)
+        if status is None:
+            resp = getattr(err, "response", None)
+            status = getattr(resp, "status_code", None)
+        try:
+            return int(status) if status is not None else None
+        except Exception:
+            return None
+
+    def _is_context_length_error(err_str: str) -> bool:
+        return (
+            "context_length_exceeded" in err_str
+            or "maximum context length" in err_str
+            or "context length" in err_str
+            or "input tokens exceed" in err_str
+        )
+
+    def _is_timeout_error(err_str: str) -> bool:
+        return "timeout" in err_str or "timed out" in err_str
+
+    def _is_retryable_status(status: Optional[int]) -> bool:
+        # 429: rate limited; 503: overload; 5xx: transient server errors
+        return status in (429, 503) or (status is not None and status >= 500)
+
+    def _is_auth_status(status: Optional[int]) -> bool:
+        return status in (401, 403)
     # Together AI (OpenAI-compatible) hosted models.
     #
     # IMPORTANT:
@@ -358,11 +435,17 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                 m['content'] = (m.get('content') or '') + str(m.get('tool_calls'))
                 m.pop('tool_calls', None)
             updated_messages.append(m)
-        while answer == '':
+        retry_count = 0
+        start_ts = time.time()
+        while answer == '' and retry_count < max_retries:
+            if call_timeout_s and (time.time() - start_ts) > call_timeout_s:
+                raise LLMTimeoutError(f"Together call exceeded {call_timeout_s}s (req_id={req_id}, model={model})")
+            retry_count += 1
             try:
                 oss_client = OpenAI(
                     base_url="https://api.together.xyz/v1",
                     api_key=os.getenv("TOGETHER_API_KEY"),
+                    timeout=(call_timeout_s or None),
                 )
                 if tools:
                     chat_completion = oss_client.chat.completions.create(
@@ -386,12 +469,28 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                 else:
                     answer = chat_completion.choices[0].message.content
             except Exception as error:
+                error_str = str(error).lower()
+                status = _get_status_code(error)
                 print(
                     f"Error calling Together (legacy endpoint-id model) req_id={req_id}: {error}. "
                     f"Note: Together often requires the endpoint Name (e.g. 'HK123/...') as `model`.",
                     flush=True,
                 )
-                time.sleep(60)
+                # Permanent failures: do not retry
+                if _is_context_length_error(error_str):
+                    raise ContextLengthExceededError(f"Together context length exceeded: {error}") from error
+                if _is_auth_status(status):
+                    raise MaxRetriesExceededError(f"Together auth error (status={status}): {error}") from error
+                if status == 400:
+                    raise MaxRetriesExceededError(f"Together invalid request (status={status}): {error}") from error
+                if retry_count >= max_retries:
+                    raise MaxRetriesExceededError(f"Together max retries exceeded: {error}") from error
+
+                sleep_s = 60 if _is_retryable_status(status) else min(5 * retry_count, 60)
+                print(f"Retry {retry_count}/{max_retries} in {sleep_s}s...", flush=True)
+                time.sleep(sleep_s)
+        if answer == '':
+            raise MaxRetriesExceededError(f"Together returned empty answer after {max_retries} attempts (req_id={req_id})")
         return answer
     if model in ['o3','o3-mini','gpt-4o','o3-high','gpt-5','gpt-5-mini','gpt-4.1','gpt-4o-mini']:
         if max_length==1024:
@@ -407,9 +506,14 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
         }
         # Default to a safe ceiling to avoid invalid_request loops on newer models.
         max_length = min(max_length, OPENAI_MAX_COMPLETION_TOKENS.get(model, 16384))
-        openai_client = get_openai_client(model=model)
+        openai_client = get_openai_client(model=model, timeout_s=(call_timeout_s or None))
         answer = ''
-        while answer=='':
+        retry_count = 0
+        start_ts = time.time()
+        while answer == '' and retry_count < max_retries:
+            if call_timeout_s and (time.time() - start_ts) > call_timeout_s:
+                raise LLMTimeoutError(f"OpenAI call exceeded {call_timeout_s}s (req_id={req_id}, model={model})")
+            retry_count += 1
             try:
                 print(f"DEBUG: Calling OpenAI model={model} req_id={req_id}", flush=True)
                 _llm_log({
@@ -418,6 +522,8 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                     "backend": "openai",
                     "model": model,
                     "max_length": max_length,
+                    "attempt": retry_count,
+                    "max_retries": max_retries,
                 })
                 t0 = time.time()
                 chat_completion = openai_client.chat.completions.create(
@@ -441,6 +547,8 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                     "duration_s": round(dur, 4),
                 })
             except Exception as error:
+                error_str = str(error).lower()
+                status = _get_status_code(error)
                 print(f"Error calling OpenAI req_id={req_id}: {error}", flush=True)
                 _llm_log({
                     "event": "error",
@@ -449,12 +557,38 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                     "model": model,
                     "error": repr(error),
                     "traceback": traceback.format_exc(),
+                    "status_code": status,
+                    "attempt": retry_count,
+                    "max_retries": max_retries,
                 })
-                # If this is a hard invalid-request error (e.g., max_tokens too large),
-                # don't retry forever. Surface it to the caller.
-                if "max_tokens is too large" in str(error) or "invalid_value" in str(error):
-                    raise
-                time.sleep(5)
+                # Permanent failures: do not retry
+                if _is_context_length_error(error_str):
+                    raise ContextLengthExceededError(f"OpenAI context length exceeded: {error}") from error
+                if _is_auth_status(status):
+                    raise MaxRetriesExceededError(f"OpenAI auth error (status={status}): {error}") from error
+                if status == 400 or "invalid_request_error" in error_str or "invalid value" in error_str:
+                    raise MaxRetriesExceededError(f"OpenAI invalid request (status={status}): {error}") from error
+
+                # Transient failures: retry with backoff (limited)
+                if retry_count >= max_retries:
+                    raise MaxRetriesExceededError(
+                        f"OpenAI transient error but max retries exceeded (status={status}): {error}"
+                    ) from error
+
+                # Retryable classes/statuses: 429/503/5xx/timeout
+                if _is_retryable_status(status) or _is_timeout_error(error_str):
+                    sleep_s = min(5 * retry_count, 60)
+                    print(f"Retry {retry_count}/{max_retries} in {sleep_s}s...", flush=True)
+                    time.sleep(sleep_s)
+                    continue
+
+                # Unknown: still retry, but bounded
+                sleep_s = min(5 * retry_count, 60)
+                print(f"Retry {retry_count}/{max_retries} in {sleep_s}s...", flush=True)
+                time.sleep(sleep_s)
+
+        if answer == '':
+            raise MaxRetriesExceededError(f"OpenAI returned empty answer after {max_retries} attempts (req_id={req_id})")
         return answer
     # Together OpenAI-compatible API (used by local HLE eval for OSS expert calls).
     # Prefer using this path with model strings like:
@@ -468,11 +602,17 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                 m['content'] += str(m['tool_calls'])
                 m.pop('tool_calls')
             updated_messages.append(m)
-        while answer=='':
+        retry_count = 0
+        start_ts = time.time()
+        while answer == '' and retry_count < max_retries:
+            if call_timeout_s and (time.time() - start_ts) > call_timeout_s:
+                raise LLMTimeoutError(f"Together call exceeded {call_timeout_s}s (req_id={req_id}, model={model})")
+            retry_count += 1
             try:
                 oss_client = OpenAI(
                     base_url = "https://api.together.xyz/v1",
-                    api_key = os.getenv("TOGETHER_API_KEY")
+                    api_key = os.getenv("TOGETHER_API_KEY"),
+                    timeout=(call_timeout_s or None),
                 )
                 if tools:
                     chat_completion = oss_client.chat.completions.create(
@@ -496,7 +636,21 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                 else:
                     answer = chat_completion.choices[0].message.content
             except Exception as error:
-                time.sleep(60)
+                error_str = str(error).lower()
+                status = _get_status_code(error)
+                # Permanent failures: do not retry
+                if _is_context_length_error(error_str):
+                    raise ContextLengthExceededError(f"Together context length exceeded: {error}") from error
+                if _is_auth_status(status):
+                    raise MaxRetriesExceededError(f"Together auth error (status={status}): {error}") from error
+                if status == 400:
+                    raise MaxRetriesExceededError(f"Together invalid request (status={status}): {error}") from error
+                if retry_count >= max_retries:
+                    raise MaxRetriesExceededError(f"Together max retries exceeded: {error}") from error
+                sleep_s = 60 if _is_retryable_status(status) else min(5 * retry_count, 60)
+                time.sleep(sleep_s)
+        if answer == '':
+            raise MaxRetriesExceededError(f"Together returned empty answer after {max_retries} attempts (req_id={req_id})")
         return answer
     elif 'qwen' in model.lower() or model_type=='vllm':
         # Check if we should use Nebius API for Qwen3-32B
@@ -507,11 +661,17 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
         if use_nebius:
             # Use Nebius API for Qwen3-32B
             answer = ''
-            while answer=='':
+            retry_count = 0
+            start_ts = time.time()
+            while answer == '' and retry_count < max_retries:
+                if call_timeout_s and (time.time() - start_ts) > call_timeout_s:
+                    raise LLMTimeoutError(f"Nebius call exceeded {call_timeout_s}s (req_id={req_id}, model={model})")
+                retry_count += 1
                 try:
                     nebius_client = OpenAI(
                         base_url="https://api.tokenfactory.nebius.com/v1/",
-                        api_key=nebius_api_key
+                        api_key=nebius_api_key,
+                        timeout=(call_timeout_s or None),
                     )
                     # Map model name to Nebius model name
                     nebius_model = "Qwen/Qwen3-32B-fast"
@@ -528,13 +688,32 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                     else:
                         answer = chat_completion.choices[0].message.content
                 except Exception as error:
-                    print('Error calling Nebius API:',error)
-                    time.sleep(60)
+                    error_str = str(error).lower()
+                    status = _get_status_code(error)
+                    print('Error calling Nebius API:', error, flush=True)
+                    # Permanent failures: do not retry
+                    if _is_context_length_error(error_str):
+                        raise ContextLengthExceededError(f"Nebius context length exceeded: {error}") from error
+                    if _is_auth_status(status):
+                        raise MaxRetriesExceededError(f"Nebius auth error (status={status}): {error}") from error
+                    if status == 400:
+                        raise MaxRetriesExceededError(f"Nebius invalid request (status={status}): {error}") from error
+                    if retry_count >= max_retries:
+                        raise MaxRetriesExceededError(f"Nebius max retries exceeded: {error}") from error
+                    sleep_s = 60 if _is_retryable_status(status) else min(5 * retry_count, 60)
+                    time.sleep(sleep_s)
+            if answer == '':
+                raise MaxRetriesExceededError(f"Nebius returned empty answer after {max_retries} attempts (req_id={req_id})")
             return answer
         else:
             # Use local vLLM server
             answer = ''
-            while answer=='':
+            retry_count = 0
+            start_ts = time.time()
+            while answer == '' and retry_count < max_retries:
+                if call_timeout_s and (time.time() - start_ts) > call_timeout_s:
+                    raise LLMTimeoutError(f"vLLM call exceeded {call_timeout_s}s (req_id={req_id}, model={model})")
+                retry_count += 1
                 config_idx = random.choice(range(len(model_config)))
                 ip_addr = model_config[config_idx]["ip_addr"]
                 port = model_config[config_idx]["port"]
@@ -548,12 +727,14 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                         "base_url": f"http://{ip_addr}:{port}/v1",
                         "max_length": max_length,
                         "stream": bool(tau2_stream_profile),
+                        "attempt": retry_count,
+                        "max_retries": max_retries,
                     })
                     req_start = time.time()
                     vllm_client = OpenAI(
                         api_key="EMPTY",
                         base_url=f"http://{ip_addr}:{port}/v1",
-                        timeout=600.0
+                        timeout=(call_timeout_s if call_timeout_s else 600.0),
                     )
                     if tau2_stream_profile:
                         # Streaming mode: measure TTFT (prefill) and decode time.
@@ -569,14 +750,24 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
 
                         # Ask for usage in the final chunk if supported by the server/client.
                         extra_body = kwargs.get("extra_body")
+                        # NOTE:
+                        # Many "expert" LLM endpoints (served with standard vLLM) are not launched with
+                        # `--enable-auto-tool-choice` and `--tool-call-parser`.
+                        # If we include `tools`, OpenAI-compatible clients default `tool_choice="auto"`,
+                        # which then triggers a 400 from those expert servers.
+                        # We only send `tools` to local checkpoint models (i.e., the Orchestrator),
+                        # which are launched with tool-calling enabled.
+                        send_tools_to_vllm = bool(tools) and os.path.exists(str(model))
+
                         stream_create_kwargs = {
                             "model": model,
                             "messages": messages,
                             "max_tokens": max_length,
                             "temperature": temperature,
-                            "tools": tools,
                             "stream": True,
                         }
+                        if send_tools_to_vllm:
+                            stream_create_kwargs["tools"] = tools
                         if extra_body:
                             stream_create_kwargs["extra_body"] = extra_body
                         try:
@@ -745,13 +936,16 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                                 )
                     else:
                         extra_body = kwargs.get("extra_body")
+                        # See note in streaming branch: only send tools to local checkpoint models.
+                        send_tools_to_vllm = bool(tools) and os.path.exists(str(model))
                         create_kwargs = {
                             "model": model,
                             "messages": messages,
                             "max_tokens": max_length,
                             "temperature": temperature,
-                            "tools": tools,
                         }
+                        if send_tools_to_vllm:
+                            create_kwargs["tools"] = tools
                         if extra_body:
                             create_kwargs["extra_body"] = extra_body
                         chat_completion = vllm_client.chat.completions.create(**create_kwargs)
@@ -771,6 +965,8 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                         else:
                             answer = chat_completion.choices[0].message.content
                 except Exception as error:
+                    error_str = str(error).lower()
+                    status = _get_status_code(error)
                     print(f'Error calling vLLM: {error}', flush=True)
                     traceback.print_exc()
                     _llm_log({
@@ -781,14 +977,52 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                         "base_url": f"http://{ip_addr}:{port}/v1",
                         "error": repr(error),
                         "traceback": traceback.format_exc(),
+                        "status_code": status,
+                        "attempt": retry_count,
+                        "max_retries": max_retries,
                     })
+                    
+                    # Detect permanent errors that should NOT be retried
+                    is_context_length_error = _is_context_length_error(error_str)
+                    is_invalid_request = (status == 400) and not is_context_length_error
+                    
+                    if is_context_length_error:
+                        # Context length exceeded - this task cannot be completed
+                        print(f"FATAL: Context length exceeded, not retrying. req_id={req_id}", flush=True)
+                        raise ContextLengthExceededError(f"Context length exceeded: {error}") from error
+
+                    if _is_auth_status(status):
+                        print(f"FATAL: Auth error (status={status}), not retrying. req_id={req_id}", flush=True)
+                        raise MaxRetriesExceededError(f"Auth error (status={status}): {error}") from error
+                    
+                    if is_invalid_request:
+                        # Other 400 errors - likely invalid request, don't retry indefinitely
+                        print(f"FATAL: Invalid request (400), not retrying. req_id={req_id}", flush=True)
+                        raise MaxRetriesExceededError(f"Invalid request: {error}") from error
+                    
+                    # Check if we've exhausted retries
+                    if retry_count >= max_retries:
+                        print(f"FATAL: Max retries ({max_retries}) exceeded. req_id={req_id}", flush=True)
+                        raise MaxRetriesExceededError(f"Max retries ({max_retries}) exceeded: {error}") from error
+
+                    # Transient errors - retry with backoff
+                    # Retryable classes/statuses: 429/503/5xx/timeout
+                    if not (_is_retryable_status(status) or _is_timeout_error(error_str)):
+                        # Unknown errors: still retry, but bounded (above)
+                        pass
+
                     if os.path.isfile(str(model_config_path)):
                         # print(f"call {model} error, load {model_config_path}")
                         with open(model_config_path) as f:
                             update_model_configs = json.load(f)
                         model_config = update_model_configs[model]
-                    print("Retrying in 5 seconds...", flush=True)
-                    time.sleep(5)
+                    sleep_s = min(5 * retry_count, 60)
+                    print(f"Retry {retry_count}/{max_retries} in {sleep_s} seconds...", flush=True)
+                    time.sleep(sleep_s)
+            
+            # Final check: if we exited the loop without an answer, something went wrong
+            if answer == '':
+                raise MaxRetriesExceededError(f"Failed to get response after {max_retries} retries")
             return answer
     elif 'claude' in model.lower():
         access_token = get_claude_token()
@@ -832,10 +1066,32 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
             "Accept": "application/json",
         }
         answer = ''
-        while answer=='':
+        retry_count = 0
+        start_ts = time.time()
+        while answer == '' and retry_count < max_retries:
+            if call_timeout_s and (time.time() - start_ts) > call_timeout_s:
+                raise LLMTimeoutError(f"Claude call exceeded {call_timeout_s}s (req_id={req_id}, model={model})")
+            retry_count += 1
             try:
                 print(f"DEBUG: Calling Claude model={model}", flush=True)
-                response = requests.post(endpoint, headers=headers, json=payload)
+                response = requests.post(
+                    endpoint,
+                    headers=headers,
+                    json=payload,
+                    timeout=(call_timeout_s if call_timeout_s else 600.0),
+                )
+                # Classify common permanent/transient HTTP failures before raising.
+                status = response.status_code
+                body = (response.text or "").lower()
+                if status >= 400:
+                    if _is_context_length_error(body):
+                        raise ContextLengthExceededError(f"Claude context length exceeded: {response.text}")
+                    if _is_auth_status(status):
+                        raise MaxRetriesExceededError(f"Claude auth error (status={status}): {response.text}")
+                    if status == 400:
+                        raise MaxRetriesExceededError(f"Claude invalid request (status={status}): {response.text}")
+                    if not _is_retryable_status(status):
+                        raise MaxRetriesExceededError(f"Claude non-retryable error (status={status}): {response.text}")
                 response.raise_for_status()
                 if return_raw_response:
                     answer = response.json()
@@ -843,7 +1099,23 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                     answer = response.json()['content'][0]['text']
                 print(f"DEBUG: Claude request successful", flush=True)
             except Exception as error:
+                error_str = str(error).lower()
+                status = getattr(getattr(error, "response", None), "status_code", None)
                 print(f"Error calling Claude: {error}", flush=True)
-                time.sleep(5)
+                # Permanent failures: do not retry
+                if _is_context_length_error(error_str):
+                    raise ContextLengthExceededError(f"Claude context length exceeded: {error}") from error
+                if _is_auth_status(int(status) if status is not None else None):
+                    raise MaxRetriesExceededError(f"Claude auth error (status={status}): {error}") from error
+                if (status == 400) or ("invalid request" in error_str):
+                    raise MaxRetriesExceededError(f"Claude invalid request (status={status}): {error}") from error
+                if retry_count >= max_retries:
+                    raise MaxRetriesExceededError(f"Claude max retries exceeded: {error}") from error
+
+                sleep_s = min(5 * retry_count, 60)
+                print(f"Retry {retry_count}/{max_retries} in {sleep_s}s...", flush=True)
+                time.sleep(sleep_s)
+        if answer == '':
+            raise MaxRetriesExceededError(f"Claude returned empty answer after {max_retries} attempts (req_id={req_id})")
         return answer
 

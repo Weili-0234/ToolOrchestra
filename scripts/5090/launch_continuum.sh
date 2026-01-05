@@ -40,6 +40,39 @@ ORCH_PORT="${ORCH_PORT:-1900}"
 # Continuum output directory (scheduler timestamps, etc.)
 export RUN_OUTPUT_DIR="${OUTPUT_DIR}"
 
+VLLM_PID=""
+KV_PID=""
+
+cleanup() {
+  set +e
+  set +u
+
+  if [ -n "${KV_PID}" ] && kill -0 "${KV_PID}" >/dev/null 2>&1; then
+    kill "${KV_PID}" >/dev/null 2>&1 || true
+  fi
+
+  if [ -n "${VLLM_PID}" ] && kill -0 "${VLLM_PID}" >/dev/null 2>&1; then
+    # Graceful shutdown so Continuum scheduler can flush RUN_OUTPUT_DIR/scheduler_timestamps.
+    kill -TERM "${VLLM_PID}" >/dev/null 2>&1 || true
+    for _ in $(seq 1 60); do
+      if kill -0 "${VLLM_PID}" >/dev/null 2>&1; then
+        sleep 1
+      else
+        break
+      fi
+    done
+    if kill -0 "${VLLM_PID}" >/dev/null 2>&1; then
+      kill -KILL "${VLLM_PID}" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # If RUN_OUTPUT_DIR differs from OUTPUT_DIR, copy the timestamp file over.
+  if [ -f "${RUN_OUTPUT_DIR}/scheduler_timestamps" ] && [ "${RUN_OUTPUT_DIR}" != "${OUTPUT_DIR}" ]; then
+    cp -f "${RUN_OUTPUT_DIR}/scheduler_timestamps" "${OUTPUT_DIR}/" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
 # Start Continuum-enabled vLLM
 CHAT_TEMPLATE_ARGS=()
 if [[ -n "${CHAT_TEMPLATE_PATH}" ]]; then
@@ -56,7 +89,30 @@ CUDA_VISIBLE_DEVICES=0 vllm serve "${CKPT_DIR}" \
   > "${LOG_DIR}/vllm_continuum_${TS}.log" 2>&1 &
 VLLM_PID=$!
 
-sleep 120
+echo "Waiting for Continuum vLLM to become ready on port ${ORCH_PORT}..."
+READY_DEADLINE_S="${READY_DEADLINE_S:-600}"
+START_TS="$(date +%s)"
+while true; do
+  # If vLLM died early, fail fast.
+  if ! kill -0 "${VLLM_PID}" >/dev/null 2>&1; then
+    echo "ERROR: Continuum vLLM process exited before becoming ready (PID: ${VLLM_PID})"
+    exit 1
+  fi
+
+  # Consider it ready when the OpenAI-compatible endpoints respond.
+  if curl -sf --max-time 2 "http://127.0.0.1:${ORCH_PORT}/health" >/dev/null 2>&1 && \
+     curl -sf --max-time 2 "http://127.0.0.1:${ORCH_PORT}/v1/models" >/dev/null 2>&1; then
+    break
+  fi
+
+  NOW="$(date +%s)"
+  if (( NOW - START_TS > READY_DEADLINE_S )); then
+    echo "ERROR: Continuum vLLM not ready after ${READY_DEADLINE_S}s (port ${ORCH_PORT})"
+    exit 1
+  fi
+  sleep 2
+done
+
 echo "Continuum vLLM ready (PID: ${VLLM_PID})"
 
 # Start KV cache sampler (sample orchestrator backend /metrics)
@@ -112,9 +168,6 @@ python run_oss.py \
   --log-dir "${LOG_DIR}" \
   2>&1 | tee "${OUTPUT_DIR}/driver.log"
 
-# Copy scheduler timestamps if present
-cp "${RUN_OUTPUT_DIR}/scheduler_timestamps" "${OUTPUT_DIR}/" 2>/dev/null || true
-
-kill "${KV_PID}" "${VLLM_PID}" 2>/dev/null || true
+# Cleanup handled by trap so timestamps can flush on graceful vLLM shutdown.
 
 

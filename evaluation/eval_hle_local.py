@@ -88,18 +88,21 @@ def _together_model_for(model_name: str) -> str:
     return model_name
 
 MODEL_MAPPING = {
-    "search-1": "gpt-5",
-    "search-2": "gpt-5-mini",
-    "search-3": "Qwen/Qwen3-32B",
-    "reasoner-1": "gpt-5",
-    "reasoner-2": "gpt-5-mini",
-    "reasoner-3": "Qwen/Qwen2.5-Coder-32B-Instruct",
-    "answer-math-1": "Qwen/Qwen2.5-Math-72B-Instruct",
-    "answer-math-2": "Qwen/Qwen2.5-Math-7B-Instruct",
-    "answer-1": "gpt-5",
-    "answer-2": "gpt-5-mini",
-    "answer-3": "meta-llama/Llama-3.3-70B-Instruct",
-    "answer-4": "Qwen/Qwen3-32B"
+    "search-1": "gpt-5", # 改成 openai/gpt-oss-20b (deployed on dedicated endpoint, with out speculative decoding as is not supported)
+    "search-2": "gpt-5-mini", # search 里面最常用的模型, 改成 
+                              # meta-llama/Llama-3.3-70B-Instruct-Turbo (deployed on dedicated endpoint, Speculative Decoding enabled)
+    "search-3": "Qwen/Qwen3-32B", # 之前用nebius API, 现在改成deployed on H100 cluster上vllm serve with speculative decoding
+    "reasoner-1": "gpt-5", # 改成 Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 (serverless API)	
+    "reasoner-2": "gpt-5-mini", # 改成 Qwen/Qwen3-Next-80B-A3B-Instruct	(deployed on dedicated endpoint, with out speculative decoding as is not supported)
+    "reasoner-3": "Qwen/Qwen2.5-Coder-32B-Instruct", # enhanced reasoning 里面被调用得最多的模型, 
+                                                     # 之前用API, 现在改成deployed on H100 cluster上vllm serve with speculative decoding
+    "answer-math-1": "Qwen/Qwen2.5-Math-72B-Instruct", # 改成 Qwen/Qwen3-Next-80B-A3B-Thinking (serverless API)
+    "answer-math-2": "Qwen/Qwen2.5-Math-7B-Instruct", # 改成 Qwen/Qwen3-Next-80B-A3B-Instruct (serverless API)
+    "answer-1": "gpt-5", # answer 里面最常用的模型, 
+                        # 改成 openai/gpt-oss-20b (deployed on dedicated endpoint, with out speculative decoding as is not supported)
+    "answer-2": "gpt-5-mini", # 改成 Qwen/Qwen3-Next-80B-A3B-Instruct (deployed on dedicated endpoint, with out speculative decoding as is not supported)
+    "answer-3": "meta-llama/Llama-3.3-70B-Instruct", # 改成 meta-llama/Llama-3.3-70B-Instruct-Turbo (deployed on dedicated endpoint, Speculative Decoding enabled)
+    "answer-4": "Qwen/Qwen3-32B" # 之前用nebius API, 现在改成deployed on H100 cluster上vllm serve with speculative decoding
 }
 TOOL_PRICING = {
     "gpt-5": {

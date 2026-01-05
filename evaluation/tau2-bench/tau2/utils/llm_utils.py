@@ -44,7 +44,12 @@ from tau2.environment.tool import Tool
 import sys
 REPO_PATH = os.getenv("REPO_PATH")
 sys.path.append(REPO_PATH)
-from LLM_CALL import get_llm_response
+from LLM_CALL import (
+    get_llm_response,
+    ContextLengthExceededError,
+    MaxRetriesExceededError,
+    LLMTimeoutError,
+)
 
 # litellm._turn_on_debug()
 
@@ -576,10 +581,37 @@ def generate(
         is_toolorchestra_main_vllm = ("orchestrator" in model.lower() and "8b" in model.lower())
         # Default OFF; enable explicitly via TAU2_TOOLORCH_STREAM_PROFILE=1.
         stream_profile = bool(is_toolorchestra_main_vllm and _TOOLORCH_STREAM_PROFILE and tau2_logger.isEnabledFor(PROFILE))
-        if is_toolorchestra_main_vllm:
-            _infer_timer = Timer()
-            _infer_timer.__enter__()
-            try:
+        try:
+            if is_toolorchestra_main_vllm:
+                _infer_timer = Timer()
+                _infer_timer.__enter__()
+                try:
+                    response = get_llm_response(
+                        model=model,
+                        messages=updated_messages,
+                        tools=updated_tools,
+                        return_raw_response=True,
+                        temperature=1,
+                        model_config=model_config,
+                        model_config_path=model_config_path,
+                        model_config_idx=config_idx,
+                        model_type='vllm',
+                        max_length=8000,
+                        tau2_stream_profile=stream_profile,
+                        extra_body=extra_body if extra_body else None,
+                    )
+                finally:
+                    _infer_timer.__exit__(None, None, None)
+                # Default: python-side wall time; if streaming profiling is enabled, prefer request-derived timings.
+                toolorchestra_vllm_infer_ms = _infer_timer.duration_ms
+                if not isinstance(response, str):
+                    toolorchestra_vllm_infer_ms = getattr(response, "tau2_vllm_infer_ms", toolorchestra_vllm_infer_ms)
+                    toolorchestra_vllm_prefill_ms = getattr(response, "tau2_vllm_prefill_ms", None)
+                    toolorchestra_vllm_decode_ms = getattr(response, "tau2_vllm_decode_ms", None)
+                    # Lengths: prompt/completion tokens
+                    toolorchestra_vllm_prefill_len = getattr(response, "tau2_vllm_prompt_tokens", None)
+                    toolorchestra_vllm_decode_len = getattr(response, "tau2_vllm_completion_tokens", None)
+            else:
                 response = get_llm_response(
                     model=model,
                     messages=updated_messages,
@@ -591,33 +623,18 @@ def generate(
                     model_config_idx=config_idx,
                     model_type='vllm',
                     max_length=8000,
-                    tau2_stream_profile=stream_profile,
                     extra_body=extra_body if extra_body else None,
                 )
-            finally:
-                _infer_timer.__exit__(None, None, None)
-            # Default: python-side wall time; if streaming profiling is enabled, prefer request-derived timings.
-            toolorchestra_vllm_infer_ms = _infer_timer.duration_ms
-            if not isinstance(response, str):
-                toolorchestra_vllm_infer_ms = getattr(response, "tau2_vllm_infer_ms", toolorchestra_vllm_infer_ms)
-                toolorchestra_vllm_prefill_ms = getattr(response, "tau2_vllm_prefill_ms", None)
-                toolorchestra_vllm_decode_ms = getattr(response, "tau2_vllm_decode_ms", None)
-                # Lengths: prompt/completion tokens
-                toolorchestra_vllm_prefill_len = getattr(response, "tau2_vllm_prompt_tokens", None)
-                toolorchestra_vllm_decode_len = getattr(response, "tau2_vllm_completion_tokens", None)
-        else:
-            response = get_llm_response(
-                model=model,
-                messages=updated_messages,
-                tools=updated_tools,
-                return_raw_response=True,
-                temperature=1,
-                model_config=model_config,
-                model_config_path=model_config_path,
-                model_config_idx=config_idx,
-                model_type='vllm',
-                max_length=8000,
-                extra_body=extra_body if extra_body else None,
+        except (ContextLengthExceededError, MaxRetriesExceededError, LLMTimeoutError) as e:
+            # LLM call failed permanently - return a STOP message so the task terminates and writes outputs.
+            tau2_logger.error(f"LLM call failed permanently: {type(e).__name__}: {e}")
+            try:
+                llm_timer.__exit__(None, None, None)
+            except Exception:
+                pass
+            return AssistantMessage(
+                content=f"###STOP### (LLM_ERROR: {type(e).__name__})",
+                tool_calls=None,
             )
         mode_to_call = None
         tool_calls = []
@@ -703,39 +720,51 @@ def generate(
             is_vllm_oss = 'gpt-oss' in mode_to_call.lower() or 'qwen3' in mode_to_call.lower()
             expert_call_type = "openai" if is_openai_api else "vllm"
 
-            if is_openai_api:
-                # Proprietary OpenAI models (gpt-5, gpt-5-mini)
-                response = get_llm_response(model=mode_to_call,messages=llm_messages,tools=original_tools,return_raw_response=True,max_length=40000,extra_body=extra_body if extra_body else None)
-            elif is_vllm_oss:
-                # OSS models via local vLLM (gpt-oss-*, qwen3-*, qwen3-next-*)
-                # Default OFF; enable explicitly via TAU2_EXPERT_STREAM_PROFILE=1.
-                # (Most evaluations don't require TTFT breakdown for experts, and streaming can be flaky.)
-                expert_stream_profile = bool(_EXPERT_STREAM_PROFILE and tau2_logger.isEnabledFor(PROFILE))
-                with open(model_config_path) as f:
-                    model_config = json.load(f)[mode_to_call]
-                tools_length = len(tokenizer(str(original_tools))['input_ids'])
-                cut_messages = cut_middle_turns(tokenizer=tokenizer,messages=litellm_messages,max_length=23000-tools_length)
-                response = get_llm_response(
-                    model=mode_to_call,
-                    messages=cut_messages,
-                    tools=original_tools,
-                    return_raw_response=True,
-                    model_config=model_config,
-                    model_config_path=model_config_path,
-                    model_config_idx=config_idx,
-                    model_type='vllm',
-                    max_length=8000,
-                    tau2_stream_profile=expert_stream_profile,
-                    extra_body=extra_body if extra_body else None,
+            try:
+                if is_openai_api:
+                    # Proprietary OpenAI models (gpt-5, gpt-5-mini)
+                    response = get_llm_response(model=mode_to_call,messages=llm_messages,tools=original_tools,return_raw_response=True,max_length=40000,extra_body=extra_body if extra_body else None)
+                elif is_vllm_oss:
+                    # OSS models via local vLLM (gpt-oss-*, qwen3-*, qwen3-next-*)
+                    # Default OFF; enable explicitly via TAU2_EXPERT_STREAM_PROFILE=1.
+                    # (Most evaluations don't require TTFT breakdown for experts, and streaming can be flaky.)
+                    expert_stream_profile = bool(_EXPERT_STREAM_PROFILE and tau2_logger.isEnabledFor(PROFILE))
+                    with open(model_config_path) as f:
+                        model_config = json.load(f)[mode_to_call]
+                    tools_length = len(tokenizer(str(original_tools))['input_ids'])
+                    cut_messages = cut_middle_turns(tokenizer=tokenizer,messages=litellm_messages,max_length=23000-tools_length)
+                    response = get_llm_response(
+                        model=mode_to_call,
+                        messages=cut_messages,
+                        tools=original_tools,
+                        return_raw_response=True,
+                        model_config=model_config,
+                        model_config_path=model_config_path,
+                        model_config_idx=config_idx,
+                        model_type='vllm',
+                        max_length=8000,
+                        tau2_stream_profile=expert_stream_profile,
+                        extra_body=extra_body if extra_body else None,
+                    )
+                    # Extract streaming profiling data if available
+                    if not isinstance(response, str):
+                        expert_prefill_ms = getattr(response, "tau2_vllm_prefill_ms", None)
+                        expert_decode_ms = getattr(response, "tau2_vllm_decode_ms", None)
+                        expert_prefill_len = getattr(response, "tau2_vllm_prompt_tokens", None)
+                        expert_decode_len = getattr(response, "tau2_vllm_completion_tokens", None)
+                else:
+                    raise ValueError(f'Model {mode_to_call} is not supported')
+            except (ContextLengthExceededError, MaxRetriesExceededError, LLMTimeoutError) as e:
+                # Expert LLM call failed permanently - stop the task.
+                tau2_logger.error(f"Expert LLM call failed permanently: {type(e).__name__}: {e}")
+                try:
+                    llm_timer.__exit__(None, None, None)
+                except Exception:
+                    pass
+                return AssistantMessage(
+                    content=f"###STOP### (LLM_ERROR: {type(e).__name__})",
+                    tool_calls=None,
                 )
-                # Extract streaming profiling data if available
-                if not isinstance(response, str):
-                    expert_prefill_ms = getattr(response, "tau2_vllm_prefill_ms", None)
-                    expert_decode_ms = getattr(response, "tau2_vllm_decode_ms", None)
-                    expert_prefill_len = getattr(response, "tau2_vllm_prompt_tokens", None)
-                    expert_decode_len = getattr(response, "tau2_vllm_completion_tokens", None)
-            else:
-                raise ValueError(f'Model {mode_to_call} is not supported')
 
             expert_timer.__exit__(None, None, None)
 
@@ -776,8 +805,25 @@ def generate(
             'tool_calls': tool_calls,
         }
     elif 'claude' in model.lower():
-        response = get_llm_response(model=model,messages=litellm_messages,tools=tools,return_raw_response=True,max_length=40000,extra_body=extra_body if extra_body else None)
-        response = get_llm_response(model=model,messages=litellm_messages,tools=tools,return_raw_response=True,max_length=40000,extra_body=extra_body if extra_body else None)
+        try:
+            response = get_llm_response(
+                model=model,
+                messages=litellm_messages,
+                tools=tools,
+                return_raw_response=True,
+                max_length=40000,
+                extra_body=extra_body if extra_body else None,
+            )
+        except (ContextLengthExceededError, MaxRetriesExceededError, LLMTimeoutError) as e:
+            tau2_logger.error(f"Claude LLM call failed permanently: {type(e).__name__}: {e}")
+            try:
+                llm_timer.__exit__(None, None, None)
+            except Exception:
+                pass
+            return AssistantMessage(
+                content=f"###STOP### (LLM_ERROR: {type(e).__name__})",
+                tool_calls=None,
+            )
         tool_calls = []
         response_content = ""
         input_tokens = 0
@@ -815,14 +861,25 @@ def generate(
                 )
         except Exception:
             pass
-        response = get_llm_response(
-            model=model,
-            messages=litellm_messages,
-            tools=tools,
-            return_raw_response=True,
-            max_length=40000,
-            extra_body=extra_body if extra_body else None,
-        )
+        try:
+            response = get_llm_response(
+                model=model,
+                messages=litellm_messages,
+                tools=tools,
+                return_raw_response=True,
+                max_length=40000,
+                extra_body=extra_body if extra_body else None,
+            )
+        except (ContextLengthExceededError, MaxRetriesExceededError, LLMTimeoutError) as e:
+            tau2_logger.error(f"LLM call failed permanently (fallback path): {type(e).__name__}: {e}")
+            try:
+                llm_timer.__exit__(None, None, None)
+            except Exception:
+                pass
+            return AssistantMessage(
+                content=f"###STOP### (LLM_ERROR: {type(e).__name__})",
+                tool_calls=None,
+            )
         tool_calls = []
         if not isinstance(response,str) and response.choices[0].message.tool_calls:
             for one_tool_call in response.choices[0].message.tool_calls:

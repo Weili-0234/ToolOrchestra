@@ -1,6 +1,6 @@
 # 技术备忘录：Together H100 Experts + RunPod 5090 Orchestrator-8B（Inference 实验准备）
 
-目标：在 **RunPod 5090 单卡** 上 `vllm serve` Orchestrator-8B，并调用 **Together H100 集群 compute node** 上部署的 3 个 expert LLM，测：
+目标：在 **RunPod 5090 单卡** 上 `vllm serve` Orchestrator-8B，并调用 **Together H100 集群 compute node** 上部署的 3 个 expert LLM，测max_concurrency={32,64,128} 下：
 - **step-wise throughput**（steps/sec）
 - **task-wise throughput**（tasks/min）
 - **5090 单卡 vLLM backend 的 KV cache util 随时间变化**（time series）

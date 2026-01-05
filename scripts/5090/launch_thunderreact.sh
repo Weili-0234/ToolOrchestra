@@ -38,6 +38,26 @@ CHAT_TEMPLATE_PATH="${CHAT_TEMPLATE_PATH:-}"
 TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-hermes}"
 ROUTER_PORT="${ROUTER_PORT:-8000}"
 
+VLLM_PID=""
+ROUTER_PID=""
+KV_PID=""
+
+cleanup() {
+  set +e
+  set +u
+
+  if [ -n "${KV_PID}" ] && kill -0 "${KV_PID}" >/dev/null 2>&1; then
+    kill "${KV_PID}" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${ROUTER_PID}" ] && kill -0 "${ROUTER_PID}" >/dev/null 2>&1; then
+    kill "${ROUTER_PID}" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${VLLM_PID}" ] && kill -0 "${VLLM_PID}" >/dev/null 2>&1; then
+    kill "${VLLM_PID}" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
 # Start vLLM backend (behind the router)
 CHAT_TEMPLATE_ARGS=()
 if [[ -n "${CHAT_TEMPLATE_PATH}" ]]; then
@@ -53,7 +73,27 @@ CUDA_VISIBLE_DEVICES=0 vllm serve "${CKPT_DIR}" \
   > "${LOG_DIR}/vllm_tr_backend_${TS}.log" 2>&1 &
 VLLM_PID=$!
 
-sleep 120
+echo "Waiting for vLLM backend to become ready on port 8100..."
+READY_DEADLINE_S="${READY_DEADLINE_S:-600}"
+START_TS="$(date +%s)"
+while true; do
+  if ! kill -0 "${VLLM_PID}" >/dev/null 2>&1; then
+    echo "ERROR: vLLM backend exited before becoming ready (PID: ${VLLM_PID})"
+    exit 1
+  fi
+
+  if curl -sf --max-time 2 "http://127.0.0.1:8100/health" >/dev/null 2>&1 && \
+     curl -sf --max-time 2 "http://127.0.0.1:8100/v1/models" >/dev/null 2>&1; then
+    break
+  fi
+
+  NOW="$(date +%s)"
+  if (( NOW - START_TS > READY_DEADLINE_S )); then
+    echo "ERROR: vLLM backend not ready after ${READY_DEADLINE_S}s (port 8100)"
+    exit 1
+  fi
+  sleep 2
+done
 echo "vLLM backend ready (PID: ${VLLM_PID})"
 
 # Start ThunderReact router
@@ -67,7 +107,23 @@ cd "${TOOL_ORCH_DIR}"
 python multinode_router.py > "${LOG_DIR}/router_${TS}.log" 2>&1 &
 ROUTER_PID=$!
 
-sleep 10
+echo "Waiting for ThunderReact router to become ready on port ${ROUTER_PORT}..."
+START_TS="$(date +%s)"
+while true; do
+  if ! kill -0 "${ROUTER_PID}" >/dev/null 2>&1; then
+    echo "ERROR: ThunderReact router exited before becoming ready (PID: ${ROUTER_PID})"
+    exit 1
+  fi
+  if curl -sf --max-time 2 "http://127.0.0.1:${ROUTER_PORT}/backends" >/dev/null 2>&1; then
+    break
+  fi
+  NOW="$(date +%s)"
+  if (( NOW - START_TS > READY_DEADLINE_S )); then
+    echo "ERROR: ThunderReact router not ready after ${READY_DEADLINE_S}s (port ${ROUTER_PORT})"
+    exit 1
+  fi
+  sleep 1
+done
 echo "ThunderReact router ready (PID: ${ROUTER_PID}, port: ${ROUTER_PORT})"
 
 # Start KV cache sampler (sample backend /metrics, not router)
@@ -128,6 +184,4 @@ python run_oss.py \
 curl -s "http://127.0.0.1:${ROUTER_PORT}/backends" > "${OUTPUT_DIR}/router_backends.json" || true
 curl -s "http://127.0.0.1:${ROUTER_PORT}/programs" > "${OUTPUT_DIR}/router_programs.json" || true
 
-kill "${KV_PID}" "${ROUTER_PID}" "${VLLM_PID}" 2>/dev/null || true
-
-
+# Cleanup handled by trap
