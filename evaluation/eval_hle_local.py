@@ -21,6 +21,7 @@ import requests
 import asyncio
 import subprocess
 import traceback
+import uuid
 from tqdm import tqdm
 from transformers import AutoTokenizer
 import sys
@@ -37,8 +38,9 @@ if os.environ.get("HF_HUB_ENABLE_HF_TRANSFER") in {"1", "true", "True"}:
             "disabling fast downloads. Install with `pip install hf_transfer` to re-enable.",
             flush=True,
         )
-REPO_PATH = os.getenv("REPO_PATH")
-sys.path.append(REPO_PATH)
+REPO_PATH = os.getenv("REPO_PATH") or os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_PATH not in sys.path:
+    sys.path.insert(0, REPO_PATH)
 from LLM_CALL import get_llm_response
 import multiprocessing as mp
 import argparse
@@ -88,21 +90,23 @@ def _together_model_for(model_name: str) -> str:
     return model_name
 
 MODEL_MAPPING = {
-    "search-1": "gpt-5", # 改成 openai/gpt-oss-20b (deployed on dedicated endpoint, with out speculative decoding as is not supported)
-    "search-2": "gpt-5-mini", # search 里面最常用的模型, 改成 
-                              # meta-llama/Llama-3.3-70B-Instruct-Turbo (deployed on dedicated endpoint, Speculative Decoding enabled)
-    "search-3": "Qwen/Qwen3-32B", # 之前用nebius API, 现在改成deployed on H100 cluster上vllm serve with speculative decoding
-    "reasoner-1": "gpt-5", # 改成 Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 (serverless API)	
-    "reasoner-2": "gpt-5-mini", # 改成 Qwen/Qwen3-Next-80B-A3B-Instruct	(deployed on dedicated endpoint, with out speculative decoding as is not supported)
-    "reasoner-3": "Qwen/Qwen2.5-Coder-32B-Instruct", # enhanced reasoning 里面被调用得最多的模型, 
-                                                     # 之前用API, 现在改成deployed on H100 cluster上vllm serve with speculative decoding
-    "answer-math-1": "Qwen/Qwen2.5-Math-72B-Instruct", # 改成 Qwen/Qwen3-Next-80B-A3B-Thinking (serverless API)
-    "answer-math-2": "Qwen/Qwen2.5-Math-7B-Instruct", # 改成 Qwen/Qwen3-Next-80B-A3B-Instruct (serverless API)
-    "answer-1": "gpt-5", # answer 里面最常用的模型, 
-                        # 改成 openai/gpt-oss-20b (deployed on dedicated endpoint, with out speculative decoding as is not supported)
-    "answer-2": "gpt-5-mini", # 改成 Qwen/Qwen3-Next-80B-A3B-Instruct (deployed on dedicated endpoint, with out speculative decoding as is not supported)
-    "answer-3": "meta-llama/Llama-3.3-70B-Instruct", # 改成 meta-llama/Llama-3.3-70B-Instruct-Turbo (deployed on dedicated endpoint, Speculative Decoding enabled)
-    "answer-4": "Qwen/Qwen3-32B" # 之前用nebius API, 现在改成deployed on H100 cluster上vllm serve with speculative decoding
+    # All reasoners → Qwen/Qwen2.5-Coder-14B-Instruct (served via vLLM endpoints in model_config)
+    "reasoner-1": "Qwen/Qwen2.5-Coder-14B-Instruct",
+    "reasoner-2": "Qwen/Qwen2.5-Coder-14B-Instruct",
+    "reasoner-3": "Qwen/Qwen2.5-Coder-14B-Instruct",
+
+    # All search → openai/gpt-oss-20b (served via vLLM endpoints in model_config)
+    "search-1": "openai/gpt-oss-20b",
+    "search-2": "openai/gpt-oss-20b",
+    "search-3": "openai/gpt-oss-20b",
+
+    # All answer (including math) → Qwen/Qwen3-32B-FP8 (served via vLLM endpoints in model_config)
+    "answer-1": "Qwen/Qwen3-32B-FP8",
+    "answer-2": "Qwen/Qwen3-32B-FP8",
+    "answer-3": "Qwen/Qwen3-32B-FP8",
+    "answer-4": "Qwen/Qwen3-32B-FP8",
+    "answer-math-1": "Qwen/Qwen3-32B-FP8",
+    "answer-math-2": "Qwen/Qwen3-32B-FP8",
 }
 TOOL_PRICING = {
     "gpt-5": {
@@ -197,24 +201,19 @@ def call_tool(arguments):
                 )
                 model_name = arguments["model"]
 
-                response = ""
-                if "gpt-5" in model_name.lower():
-                    response = get_llm_response(
-                        model=model_name,
-                        messages=prompt,
-                        return_raw_response=True,
-                        temperature=1,
-                        max_length=40000,
-                    )
-                elif "qwen2.5-coder" in model_name.lower():
-                    response = get_llm_response(
-                        model=_together_model_for(model_name),
-                        messages=prompt,
-                        return_raw_response=True,
-                        model_type="nv/dev",
-                        max_length=8000,
-                        temperature=0.2,
-                    )
+                llm_t0 = time.perf_counter()
+                response = get_llm_response(
+                    model=model_name,
+                    messages=prompt,
+                    return_raw_response=True,
+                    model_type="vllm",
+                    max_length=8000,
+                    temperature=0.2,
+                    model_config=arguments["vllm_model_configs"][model_name],
+                    model_config_path=arguments["vllm_model_configs"]["vllm_model_config_path"],
+                    model_config_idx=arguments["eid"],
+                )
+                arguments["_llm_ms"] = (time.perf_counter() - llm_t0) * 1000.0
 
                 if isinstance(response, str):
                     arguments["generated_code"] = ""
@@ -260,14 +259,14 @@ def call_tool(arguments):
 
                 if "qwen3" in arguments["model"].lower():
                     model_name = arguments["model"]
-                    messages = [
-                        {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
-                        {"role": "user", "content": prompt},
-                    ]
-                    arguments["messages"] = messages
+                    prompt2 = (
+                        prompt
+                        + "\nWrap the thinking process and explanation between <think> and </think> and wrap only the exact answer without any explanation within <answer> and </answer>."
+                    )
+                    arguments["messages"] = prompt2
                     response = get_llm_response(
                         model=model_name,
-                        messages=messages,
+                        messages=prompt2,
                         return_raw_response=True,
                         model_type="vllm",
                         max_length=8000,
@@ -275,6 +274,7 @@ def call_tool(arguments):
                         model_config=arguments["vllm_model_configs"][model_name],
                         model_config_path=arguments["vllm_model_configs"]["vllm_model_config_path"],
                         model_config_idx=arguments["eid"],
+                        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
                     )
                     arguments["_expert_ms"] = (time.perf_counter() - expert_t0) * 1000.0
                     if isinstance(response, str):
@@ -283,11 +283,10 @@ def call_tool(arguments):
                         arguments["correctness"] = False
                         return arguments
                     response_str = response.choices[0].message.content
-                    if not isinstance(response_str, str) or "\\boxed{" not in response_str:
-                        pred = ""
+                    if isinstance(response_str, str):
+                        pred = response_str.split("<answer>")[-1].split("</answer>")[0].strip()
                     else:
-                        pred_components = response_str.split("\\boxed{")[-1].split("}")[:-1]
-                        pred = "}".join(pred_components).strip()
+                        pred = ""
 
                 elif "qwen2.5-math" in arguments["model"].lower():
                     model_name = arguments["model"]
@@ -377,19 +376,25 @@ def call_tool(arguments):
                 elif pred.strip().lower() == arguments["answer"].strip().lower():
                     correctness = True
                 else:
-                    eval_prompt = (
-                        f"Question: {arguments['problem']}\n\n"
-                        f"Student answer: {pred}\n\n"
-                        f"Reference answer: {arguments['answer']}\n\n"
-                        "Assume that the reference answer is correct. Output <correct>True</correct> if the student answer matches the reference answer. Output <correct>False</correct> if the student answer does not match the reference answer."
-                    )
-                    judge_t0 = time.perf_counter()
-                    eval_response = get_llm_response(model="gpt-5", messages=eval_prompt, temperature=1)
-                    judge_ms = (time.perf_counter() - judge_t0) * 1000.0
-                    arguments["_judge_ms"] = judge_ms
-                    log_user_judge_event("evaluator", model="gpt-5", duration_ms=judge_ms)
-                    eval_result = eval_response.split("<correct>")[-1].split("</correct>")[0]
-                    correctness = eval_result.lower() == "true"
+                    # Throughput experiments: judge disabled by default (exact match only).
+                    enable_judge = os.getenv("HLE_ENABLE_JUDGE", "0").strip().lower() in {"1", "true", "yes"}
+                    judge_model = (os.getenv("HLE_JUDGE_MODEL", "gpt-5-mini") or "gpt-5-mini").strip()
+                    if enable_judge:
+                        eval_prompt = (
+                            f"Question: {arguments['problem']}\n\n"
+                            f"Student answer: {pred}\n\n"
+                            f"Reference answer: {arguments['answer']}\n\n"
+                            "Assume that the reference answer is correct. Output <correct>True</correct> if the student answer matches the reference answer. Output <correct>False</correct> if the student answer does not match the reference answer."
+                        )
+                        judge_t0 = time.perf_counter()
+                        eval_response = get_llm_response(model=judge_model, messages=eval_prompt, temperature=1)
+                        judge_ms = (time.perf_counter() - judge_t0) * 1000.0
+                        arguments["_judge_ms"] = judge_ms
+                        log_user_judge_event("evaluator", model=judge_model, duration_ms=judge_ms)
+                        eval_result = eval_response.split("<correct>")[-1].split("</correct>")[0]
+                        correctness = eval_result.lower() == "true"
+                    else:
+                        correctness = False
 
                 arguments["response"] = response_str
                 arguments["pred"] = pred
@@ -407,48 +412,57 @@ def call_tool(arguments):
                 cur_query_writer = arguments["model"]
                 query_to_call = None
 
-                if "gpt-5" in cur_query_writer.lower():
-                    response = get_llm_response(
-                        model=cur_query_writer,
-                        messages=prompt,
-                        return_raw_response=True,
-                        temperature=1,
-                        max_length=40000,
-                    )
-                    if isinstance(response, str) or not response:
-                        query_to_call = arguments["problem"]
-                    else:
+                query_llm_t0 = time.perf_counter()
+                response = get_llm_response(
+                    model=cur_query_writer,
+                    messages=[{"role": "user", "content": prompt}],
+                    return_raw_response=True,
+                    model_type="vllm",
+                    max_length=8000,
+                    temperature=0.2,
+                    model_config=arguments["vllm_model_configs"][cur_query_writer],
+                    model_config_path=arguments["vllm_model_configs"]["vllm_model_config_path"],
+                    model_config_idx=arguments["eid"],
+                )
+                arguments["_query_llm_ms"] = (time.perf_counter() - query_llm_t0) * 1000.0
+                if isinstance(response, str):
+                    query_to_call = arguments["problem"]
+                else:
+                    try:
                         query_to_call = response.choices[0].message.content.split("<query>")[-1].split("</query>")[0]
-                elif "qwen3" in cur_query_writer.lower():
-                    response = get_llm_response(
-                        model=cur_query_writer,
-                        messages=prompt,
-                        return_raw_response=True,
-                        model_type="vllm",
-                        max_length=8000,
-                        temperature=0.2,
-                        model_config=arguments["vllm_model_configs"][cur_query_writer],
-                        model_config_path=arguments["vllm_model_configs"]["vllm_model_config_path"],
-                        model_config_idx=arguments["eid"],
-                    )
-                    if isinstance(response, str):
+                    except Exception:
                         query_to_call = arguments["problem"]
-                    else:
-                        query_to_call = response.choices[0].message.content.split("<query>")[-1].split("</query>")[0]
 
                 if query_to_call is not None and len(query_to_call) >= 5:
                     payload = {"queries": [query_to_call[:390]], "topk": 50, "return_scores": True, "eid": arguments["id"]}
                     results = None
                     all_vllm_model_configs = arguments["vllm_model_configs"]
-                    while not results:
+                    retrieval_t0 = time.perf_counter()
+                    retrieval_retries = 0
+                    max_attempts = int(os.getenv("HLE_RETRIEVAL_MAX_ATTEMPTS", "8"))
+                    connect_timeout_s = float(os.getenv("HLE_RETRIEVAL_CONNECT_TIMEOUT_S", "3"))
+                    read_timeout_s = float(os.getenv("HLE_RETRIEVAL_READ_TIMEOUT_S", "60"))
+                    base_backoff_s = float(os.getenv("HLE_RETRIEVAL_BACKOFF_S", "2"))
+                    for attempt in range(max_attempts):
                         try:
-                            cur_model_config = random.choice(all_vllm_model_configs["retrieval"])
-                            results = requests.post(
+                            endpoints = all_vllm_model_configs.get("retrieval") or []
+                            if not endpoints:
+                                raise RuntimeError("no_retrieval_endpoints_configured")
+                            cur_model_config = random.choice(endpoints)
+                            resp = requests.post(
                                 f'http://{cur_model_config["ip_addr"]}:{cur_model_config["port"]}/retrieve',
                                 json=payload,
-                            ).json()
+                                timeout=(connect_timeout_s, read_timeout_s),
+                            )
+                            resp.raise_for_status()
+                            results = resp.json()
+                            break
                         except Exception:
-                            time.sleep(3)
+                            retrieval_retries += 1
+                            time.sleep(base_backoff_s * (attempt + 1))
+                            continue
+                    arguments["_retrieval_ms"] = (time.perf_counter() - retrieval_t0) * 1000.0
+                    arguments["_retrieval_retries"] = retrieval_retries
 
                     if results:
                         # Distinguish local-only retrieval vs Tavily fallback (if enabled on retrieval server).
@@ -612,6 +626,17 @@ def run_single(e):
     all_tool_responses = {}
     all_message_responses = {}
     used_tools = []
+    program_id = f"hle:{e['id']}:{uuid.uuid4().hex[:8]}"
+    router_url = (os.getenv("ROUTER_URL") or "").strip()
+
+    def _release_program() -> None:
+        if not router_url:
+            return
+        try:
+            requests.post(f"{router_url.rstrip('/')}/programs/release", json={"program_id": program_id}, timeout=2.0)
+        except Exception:
+            return
+
     for step in range(MAX_ROUNDS):
         set_step_context(step)
         cur_output_dir = os.path.join(my_output_dir,f"step_{step}")
@@ -682,6 +707,12 @@ def run_single(e):
             model_config_path=vllm_model_configs['vllm_model_config_path'],
             model_config_idx=e['eid'],
             tau2_stream_profile=True,
+            extra_body={
+                # Baseline/continuum may ignore these; TR-new uses program_id for scheduling.
+                "program_id": program_id,
+                "job_id": program_id,
+                "is_last_step": bool(step == MAX_ROUNDS - 1),
+            },
         )
         orch_ms = (time.perf_counter() - orch_t0) * 1000.0
         if not isinstance(response, str):
@@ -854,9 +885,16 @@ def run_single(e):
                 if 'qwen3' in expert_model_to_call.lower():
                     max_code_length = 12000
                     max_context_length = 24000
+                elif 'gpt-oss' in expert_model_to_call.lower():
+                    max_code_length = 12000
+                    max_context_length = 24000
                 elif 'gpt-5' in expert_model_to_call.lower():
                     max_code_length = 40000
                     max_context_length = 120000
+                else:
+                    # Conservative defaults for unknown search models.
+                    max_code_length = 12000
+                    max_context_length = 24000
                 doc_str = ''
                 for doc_idx, doc in enumerate(doc_list):
                     if 'gpt-5' in expert_model_to_call.lower():
@@ -920,9 +958,15 @@ def run_single(e):
                 for one_doc in cur_response['search_results_data'][::-1]:
                     if not one_doc in doc_list:
                         doc_list.append(one_doc)
+        log_profile_event(
+            "step_complete",
+            ts_unix=time.time(),
+            step=step,
+            job_id=program_id,
+            tool=used_tools[-1] if used_tools else None,
+        )
         if finish_flag:
             break
-
     return_dict = {
         'id': e['id'],
         'problem': problem,
@@ -941,7 +985,15 @@ def run_single(e):
         print(f"[HLE_TASK_COMPLETE] id={e['id']} status={task_status} correct={final_correct} error_type={task_error_type}", flush=True)
     else:
         print(f"[HLE_TASK_COMPLETE] id={e['id']} status={task_status} correct={final_correct}", flush=True)
+    now = time.time()
+    ts_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now))
+    print(
+        f"[HLE_TRIAL_COMPLETE] ts_iso={ts_iso} ts_unix={now:.3f} task_id={e['id']} job_id={program_id} "
+        f"status={task_status} correct={final_correct}",
+        flush=True,
+    )
     clear_task_context()
+    _release_program()
     return return_dict
 
 if __name__=='__main__':

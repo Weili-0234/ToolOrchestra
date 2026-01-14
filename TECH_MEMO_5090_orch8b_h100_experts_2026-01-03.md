@@ -117,13 +117,13 @@ curl -sS --max-time 5 http://127.0.0.1:1920/v1/models
 ### 5.1 5090 启动脚本现状（需要你决策/补齐的点）
 repo 里已有 `scripts/5090/launch_{baseline,thunderreact,continuum}.sh`，但它们当前 **没有传 `--chat-template`**。
 
+更正（重要）：`Nemotron-Orchestrator-8B` 的 checkpoint（`tokenizer_config.json`）里 **自带 chat template**，因此默认不需要也不建议强行传 `--chat-template`（避免模板不匹配带来的 tool call 格式偏差）。
+
 实验建议：
 - Orchestrator-8B 建议统一使用：
-  - `--chat-template <ToolOrchestra>/evaluation/tool_chat_template_llama3.1_json.jinja`
   - `--enable-auto-tool-choice`
-  - `--tool-call-parser <与你 vLLM 版本匹配的 parser>`
-
-否则可能复现“chat template / message header parse error”类问题。
+  - `--tool-call-parser <与你 vLLM 版本匹配的 parser>`（ToolOrchestra 默认 `hermes`）
+- 仅当你明确要覆盖模板时，才传 `--chat-template <path>`，并配套验证 tool call 的解析与下游兼容性。
 
 ### 5.2 model_config 原则（关键）
 当 driver 在 5090 上跑时：
@@ -175,5 +175,4 @@ curl -sS --max-time 5 http://127.0.0.1:1920/v1/models
 curl -sS --max-time 5 http://127.0.0.1:1900/v1/models
 curl -sS --max-time 5 http://127.0.0.1:1900/metrics | head -n 20
 ```
-
 

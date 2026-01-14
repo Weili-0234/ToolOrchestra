@@ -48,22 +48,34 @@ env/
 *.ckpt
 *.onnx
 Nemotron-Orchestrator-8B/
+out-of-date-scripts/
+profile_charts/
+smoke_test_oss/
 
 # Logs and outputs
 *.log
 *.out
 *.err
 logs/
+tmp_logs/
+expert_logs/
+node_modules/
+log_oss*/
 outputs/
 wandb/
 runs/
 tensorboard/
+outputs_oss_frames_*/
+outputs_oss_hle_*/
+outputs_oss*/
+logs_oss*/
 
 # Data files (optional - uncomment if needed)
 # *.jsonl
 # *.json
 # *.csv
 # *.parquet
+profile_analysis.json
 
 # PDM / Poetry
 .pdm.toml

@@ -418,6 +418,98 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
 
     def _is_auth_status(status: Optional[int]) -> bool:
         return status in (401, 403)
+
+    def _extract_usage_fields(chat_completion: Any) -> Dict[str, Any]:
+        """
+        Best-effort extraction of token usage fields from OpenAI-compatible responses.
+
+        vLLM (OpenAI-compatible) may include:
+          usage.prompt_tokens_details.cached_tokens
+        """
+        usage_obj = getattr(chat_completion, "usage", None)
+        if usage_obj is None and isinstance(chat_completion, dict):
+            usage_obj = chat_completion.get("usage")
+
+        def _get(obj: Any, key: str) -> Any:
+            if obj is None:
+                return None
+            if isinstance(obj, dict):
+                return obj.get(key)
+            return getattr(obj, key, None)
+
+        usage: Dict[str, Any] = {}
+        usage["prompt_tokens"] = _get(usage_obj, "prompt_tokens")
+        usage["completion_tokens"] = _get(usage_obj, "completion_tokens")
+        usage["total_tokens"] = _get(usage_obj, "total_tokens")
+        ptd = _get(usage_obj, "prompt_tokens_details")
+        cached = _get(ptd, "cached_tokens")
+        if cached is None:
+            cached = _get(ptd, "cached_prompt_tokens")
+        if cached is None and isinstance(ptd, dict):
+            # Fallback: find any numeric "*cache*" field.
+            for k, v in ptd.items():
+                if "cache" in str(k).lower():
+                    try:
+                        float(v)
+                    except Exception:
+                        continue
+                    cached = v
+                    break
+        if cached is None:
+            cached = _get(usage_obj, "cached_tokens")
+        if cached is not None:
+            usage["cached_tokens"] = cached
+        if isinstance(ptd, dict) and ptd:
+            # Useful for debugging which fields are present; kept small in practice.
+            usage["prompt_tokens_details"] = ptd
+        return {k: v for k, v in usage.items() if v is not None}
+
+    def _maybe_log_orchestrator_prefix_cache_usage(*, model: Any, base_url: str, req_id: str, usage_fields: Dict[str, Any]) -> None:
+        """
+        If enabled, append a JSONL record for orchestrator requests with token usage.
+
+        Enable by setting:
+          TOOL_ORCH_USAGE_LOG_PATH=/path/to/usage_orch.jsonl
+        """
+        log_path = os.getenv("TOOL_ORCH_USAGE_LOG_PATH", "").strip()
+        if not log_path:
+            return
+        # Only log for local checkpoint models (orchestrator), not expert models.
+        try:
+            if not (isinstance(model, str) and os.path.exists(model)):
+                return
+        except Exception:
+            return
+        if "prompt_tokens" not in usage_fields:
+            return
+        inferred_cached = False
+        if "cached_tokens" not in usage_fields:
+            # vLLM may omit prompt_tokens_details when cached_tokens == 0.
+            usage_fields = dict(usage_fields)
+            usage_fields["cached_tokens"] = 0
+            inferred_cached = True
+        try:
+            prompt_tokens = float(usage_fields.get("prompt_tokens") or 0)
+            cached_tokens = float(usage_fields.get("cached_tokens") or 0)
+            ratio = (cached_tokens / prompt_tokens) if prompt_tokens > 0 else None
+        except Exception:
+            ratio = None
+        rec = {
+            "ts_unix": time.time(),
+            "ts_iso": datetime.now().isoformat(timespec="seconds"),
+            "req_id": req_id,
+            "base_url": base_url,
+            "model": model,
+            **usage_fields,
+            "cached_tokens_ratio": ratio,
+            "cached_tokens_inferred": inferred_cached,
+        }
+        try:
+            os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:
+            return
     # Together AI (OpenAI-compatible) hosted models.
     #
     # IMPORTANT:
@@ -609,6 +701,17 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                 raise LLMTimeoutError(f"Together call exceeded {call_timeout_s}s (req_id={req_id}, model={model})")
             retry_count += 1
             try:
+                print(f"DEBUG: Calling Together at https://api.together.xyz/v1/chat/completions (model={model}) req_id={req_id}", flush=True)
+                _llm_log({
+                    "event": "request",
+                    "req_id": req_id,
+                    "backend": "together",
+                    "model": model,
+                    "base_url": "https://api.together.xyz/v1",
+                    "max_length": max_length,
+                    "attempt": retry_count,
+                    "max_retries": max_retries,
+                })
                 oss_client = OpenAI(
                     base_url = "https://api.together.xyz/v1",
                     api_key = os.getenv("TOGETHER_API_KEY"),
@@ -915,6 +1018,12 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                             "prompt_tokens": int(prompt_tokens or 0),
                             "completion_tokens": int(completion_tokens or 0),
                         })
+                        _maybe_log_orchestrator_prefix_cache_usage(
+                            model=model,
+                            base_url=f"http://{ip_addr}:{port}/v1",
+                            req_id=req_id,
+                            usage_fields=_extract_usage_fields(chat_completion),
+                        )
 
                         if return_raw_response:
                             answer = chat_completion
@@ -959,6 +1068,12 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                             "base_url": f"http://{ip_addr}:{port}/v1",
                             "duration_s": round(req_dur, 4),
                         })
+                        _maybe_log_orchestrator_prefix_cache_usage(
+                            model=model,
+                            base_url=f"http://{ip_addr}:{port}/v1",
+                            req_id=req_id,
+                            usage_fields=_extract_usage_fields(chat_completion),
+                        )
                         
                         if return_raw_response:
                             answer = chat_completion
@@ -1118,4 +1233,3 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
         if answer == '':
             raise MaxRetriesExceededError(f"Claude returned empty answer after {max_retries} attempts (req_id={req_id})")
         return answer
-
