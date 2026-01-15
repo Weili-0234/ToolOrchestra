@@ -952,6 +952,17 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                         # Prefer usage if present; otherwise keep as 0 to preserve compatibility.
                         prompt_tokens = getattr(final_usage, "prompt_tokens", 0) if final_usage is not None else 0
                         completion_tokens = getattr(final_usage, "completion_tokens", 0) if final_usage is not None else 0
+                        total_tokens = getattr(final_usage, "total_tokens", 0) if final_usage is not None else 0
+                        if final_usage is not None:
+                            if isinstance(final_usage, dict):
+                                prompt_tokens_details = final_usage.get("prompt_tokens_details")
+                                cached_tokens = final_usage.get("cached_tokens")
+                            else:
+                                prompt_tokens_details = getattr(final_usage, "prompt_tokens_details", None)
+                                cached_tokens = getattr(final_usage, "cached_tokens", None)
+                        else:
+                            prompt_tokens_details = None
+                            cached_tokens = None
 
                         class _Fn:
                             def __init__(self, name, arguments):
@@ -974,9 +985,14 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                                 self.message = message
 
                         class _Usage:
-                            def __init__(self, prompt_tokens, completion_tokens):
+                            def __init__(self, prompt_tokens, completion_tokens, total_tokens, prompt_tokens_details, cached_tokens):
                                 self.prompt_tokens = int(prompt_tokens or 0)
                                 self.completion_tokens = int(completion_tokens or 0)
+                                self.total_tokens = int(total_tokens or 0)
+                                if prompt_tokens_details is not None:
+                                    self.prompt_tokens_details = prompt_tokens_details
+                                if cached_tokens is not None:
+                                    self.cached_tokens = cached_tokens
 
                         class _ChatCompletion:
                             def __init__(self, choices, usage):
@@ -993,7 +1009,16 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
 
                         content = "".join(content_parts)
                         msg = _Msg(content=content, tool_calls=tool_calls or None)
-                        chat_completion = _ChatCompletion(choices=[_Choice(msg)], usage=_Usage(prompt_tokens, completion_tokens))
+                        chat_completion = _ChatCompletion(
+                            choices=[_Choice(msg)],
+                            usage=_Usage(
+                                prompt_tokens,
+                                completion_tokens,
+                                total_tokens,
+                                prompt_tokens_details,
+                                cached_tokens,
+                            ),
+                        )
 
                         # Attach timing/length fields for tau2 profiling
                         chat_completion.tau2_vllm_infer_ms = infer_ms
