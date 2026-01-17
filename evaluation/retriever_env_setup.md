@@ -41,7 +41,7 @@ pip install packaging ninja psutil
 pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
 
 # 6) 安装其他依赖
-pip install transformers datasets pyserini uvicorn fastapi tavily-python hf_transfer
+pip install transformers datasets uvicorn fastapi tavily-python hf_transfer
 ```
 
 ---

@@ -51,7 +51,7 @@ RETRIEVAL_PORT="${RETRIEVAL_PORT:-1401}"
 
 VLLM_GPU_MEM_UTIL="${VLLM_GPU_MEM_UTIL:-0.95}"
 
-RETRIEVER_CONDA_ENV="${RETRIEVER_CONDA_ENV:-retriever}"
+RETRIEVER_CONDA_ENV="${RETRIEVER_CONDA_ENV:-retriever-clean}"
 BASELINE_CONDA_ENV="${BASELINE_CONDA_ENV:-vllm1}"
 TR_CONDA_ENV="${TR_CONDA_ENV:-vllm1}"
 CONTINUUM_CONDA_ENV="${CONTINUUM_CONDA_ENV:-vllm-continuum}"
@@ -83,22 +83,77 @@ EVAL_LOG="${LOG_DIR}/eval_driver.log"
 SAMPLER_LOG="${LOG_DIR}/metrics_sampler.log"
 GPU_SAMPLER_LOG="${LOG_DIR}/gpu_sm_sampler.log"
 
+START_RETRIEVAL="${START_RETRIEVAL:-1}"
+RETRIEVAL_CACHE_DIR="${RETRIEVAL_CACHE_DIR:-${OUT_DIR}/retrieval_cache}"
+KILL_PORTS="${KILL_PORTS:-1}"
+
+RET_PID=""
+ORCH_PID=""
+TR_PID=""
+
 source ~/miniconda3/etc/profile.d/conda.sh
 
 ulimit -n 1048576 2>/dev/null || ulimit -n 65535 2>/dev/null || true
 echo "[ulimit] nofile soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
 
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+port_in_use() {
+  local port="${1:?port}"
+  lsof -tiTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+kill_port_listeners() {
+  local port="${1:?port}"
+  local pids=""
+  pids="$(lsof -tiTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true)"
+  if [[ -z "${pids}" ]]; then
+    return 0
+  fi
+  echo "[cleanup] killing listeners on port ${port}: ${pids}"
+  kill ${pids} >/dev/null 2>&1 || true
+  sleep 0.2
+  kill -9 ${pids} >/dev/null 2>&1 || true
+}
+
+wait_port_free() {
+  local port="${1:?port}"
+  local timeout_sec="${2:-20}"
+  local t0
+  t0="$(date +%s)"
+  while port_in_use "${port}"; do
+    if (( $(date +%s) - t0 > timeout_sec )); then
+      return 1
+    fi
+    sleep 0.2
+  done
+  return 0
+}
+
 cleanup() {
   set +e
   echo "[cleanup] stopping background processes..."
-  jobs -p | xargs -r kill >/dev/null 2>&1 || true
-  fuser -k "${ORCH_PORT}/tcp" >/dev/null 2>&1 || true
-  fuser -k "${TR_ROUTER_PORT}/tcp" >/dev/null 2>&1 || true
-  fuser -k "${TR_BACKEND_PORT}/tcp" >/dev/null 2>&1 || true
-  fuser -k "${RETRIEVAL_PORT}/tcp" >/dev/null 2>&1 || true
-  pkill -f "vllm serve ${CKPT_DIR}" >/dev/null 2>&1 || true
-  pkill -f "python .*retrieval_hle.py" >/dev/null 2>&1 || true
-  pkill -f "python -m ThunderReact" >/dev/null 2>&1 || true
+
+  if [[ -n "${TR_PID}" ]] && kill -0 "${TR_PID}" >/dev/null 2>&1; then
+    kill "${TR_PID}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${ORCH_PID}" ]] && kill -0 "${ORCH_PID}" >/dev/null 2>&1; then
+    kill "${ORCH_PID}" >/dev/null 2>&1 || true
+  fi
+  if [[ "${START_RETRIEVAL}" == "1" ]] && [[ -n "${RET_PID}" ]] && kill -0 "${RET_PID}" >/dev/null 2>&1; then
+    kill "${RET_PID}" >/dev/null 2>&1 || true
+  fi
+
+  if [[ "${KILL_PORTS}" == "1" ]]; then
+    kill_port_listeners "${ORCH_PORT}"
+    kill_port_listeners "${TR_ROUTER_PORT}"
+    kill_port_listeners "${TR_BACKEND_PORT}"
+    if [[ "${START_RETRIEVAL}" == "1" ]]; then
+      kill_port_listeners "${RETRIEVAL_PORT}"
+    fi
+  fi
 }
 trap cleanup EXIT
 
@@ -109,6 +164,23 @@ echo "C=${CONCURRENCY} rep=${REP_IDX}"
 echo "window offsets (sec): ${WINDOW_START_SEC}..${WINDOW_END_SEC}"
 echo "timeout: ${EVAL_TIMEOUT_MIN}m"
 echo "out: ${OUT_DIR}"
+
+if [[ "${KILL_PORTS}" == "1" ]]; then
+  kill_port_listeners "${ORCH_PORT}"
+  kill_port_listeners "${TR_ROUTER_PORT}"
+  kill_port_listeners "${TR_BACKEND_PORT}"
+  if [[ "${START_RETRIEVAL}" == "1" ]]; then
+    kill_port_listeners "${RETRIEVAL_PORT}"
+  fi
+  wait_port_free "${ORCH_PORT}" || { echo "ERROR: port ${ORCH_PORT} still in use after cleanup" >&2; exit 1; }
+  wait_port_free "${TR_ROUTER_PORT}" || { echo "ERROR: port ${TR_ROUTER_PORT} still in use after cleanup" >&2; exit 1; }
+  wait_port_free "${TR_BACKEND_PORT}" || { echo "ERROR: port ${TR_BACKEND_PORT} still in use after cleanup" >&2; exit 1; }
+  if [[ "${START_RETRIEVAL}" == "1" ]]; then
+    wait_port_free "${RETRIEVAL_PORT}" || { echo "ERROR: port ${RETRIEVAL_PORT} still in use after cleanup" >&2; exit 1; }
+  fi
+fi
+
+log "phase=preflight done"
 
 echo "[preflight] checking expert tunnels..."
 for p in 1840 1841 1842 1843 1810 1811 1820 1821; do
@@ -143,26 +215,33 @@ cat > "${MODEL_CONFIG_PATH}" <<EOF
 }
 EOF
 
-echo "[retrieval] starting on GPU ${RET_GPU} port ${RETRIEVAL_PORT} (env=${RETRIEVER_CONDA_ENV})..."
-(conda activate "${RETRIEVER_CONDA_ENV}" >/dev/null 2>&1 || conda activate "${RETRIEVER_CONDA_ENV}") || true
-( \
-  source ~/miniconda3/etc/profile.d/conda.sh && conda activate "${RETRIEVER_CONDA_ENV}" && \
-  export CUDA_VISIBLE_DEVICES="${RET_GPU}" && \
-  export INDEX_DIR="${INDEX_DIR}" && \
-  python "${EVAL_DIR}/retrieval_hle.py" \
-    --port "${RETRIEVAL_PORT}" \
-    --new_cache_dir "${OUT_DIR}/retrieval_cache" \
-    --example_id_file "${EVAL_DIR}/examples.json" \
-    --tavily_key "${TAVILY_KEY:-}" \
-    > "${RETRIEVAL_LOG}" 2>&1 \
-) &
-RET_PID=$!
+log "phase=retrieval start"
+if [[ "${START_RETRIEVAL}" == "1" ]]; then
+  echo "[retrieval] starting on GPU ${RET_GPU} port ${RETRIEVAL_PORT} (env=${RETRIEVER_CONDA_ENV})..."
+  (conda activate "${RETRIEVER_CONDA_ENV}" >/dev/null 2>&1 || conda activate "${RETRIEVER_CONDA_ENV}") || true
+  ( \
+    source ~/miniconda3/etc/profile.d/conda.sh && conda activate "${RETRIEVER_CONDA_ENV}" && \
+    export CUDA_VISIBLE_DEVICES="${RET_GPU}" && \
+    export INDEX_DIR="${INDEX_DIR}" && \
+    python "${EVAL_DIR}/retrieval_hle.py" \
+      --port "${RETRIEVAL_PORT}" \
+      --new_cache_dir "${RETRIEVAL_CACHE_DIR}" \
+      --example_id_file "${EVAL_DIR}/examples.json" \
+      --tavily_key "${TAVILY_KEY:-}" \
+      > "${RETRIEVAL_LOG}" 2>&1 \
+  ) &
+  RET_PID=$!
+else
+  echo "[retrieval] using existing server on port ${RETRIEVAL_PORT} (START_RETRIEVAL=0)"
+fi
 
 echo "[retrieval] waiting /openapi.json..."
 for _ in $(seq 1 600); do
-  if ! kill -0 "${RET_PID}" >/dev/null 2>&1; then
-    echo "ERROR: retrieval exited early. See ${RETRIEVAL_LOG}" >&2
-    exit 1
+  if [[ "${START_RETRIEVAL}" == "1" ]]; then
+    if ! kill -0 "${RET_PID}" >/dev/null 2>&1; then
+      echo "ERROR: retrieval exited early. See ${RETRIEVAL_LOG}" >&2
+      exit 1
+    fi
   fi
   if curl -sf --max-time 2 "http://127.0.0.1:${RETRIEVAL_PORT}/openapi.json" >/dev/null 2>&1; then
     break
@@ -170,6 +249,7 @@ for _ in $(seq 1 600); do
   sleep 1
 done
 echo "[retrieval] ready."
+log "phase=retrieval ready"
 
 echo "[orchestrator] starting (${SCHEDULER}) on GPU ${ORCH_GPU}..."
 
@@ -262,8 +342,10 @@ for _ in $(seq 1 600); do
   sleep 1
 done
 echo "[orchestrator] ready."
+log "phase=orchestrator ready"
 
 if [[ "${SCHEDULER}" == "trnew" ]]; then
+  log "phase=tr_router start"
   echo "[trnew] starting router on port ${TR_ROUTER_PORT}..."
   export ROUTER_URL="http://127.0.0.1:${TR_ROUTER_PORT}"
   # Must run from repo root so `python -m ThunderReact` resolves the symlink.
@@ -274,6 +356,8 @@ if [[ "${SCHEDULER}" == "trnew" ]]; then
       --port "${TR_ROUTER_PORT}" \
       --backends "http://127.0.0.1:${TR_BACKEND_PORT}" \
       --router tr \
+      --profile \
+      --profile-dir "${OUT_DIR}/tr_profiles" \
       --metrics \
       --metrics-interval 5 \
       > "${TR_ROUTER_LOG}" 2>&1) &
@@ -290,6 +374,7 @@ if [[ "${SCHEDULER}" == "trnew" ]]; then
     sleep 1
   done
   echo "[trnew] router ready."
+  log "phase=tr_router ready"
 
   # Update orchestrator endpoint in model_config to point to TR router.
   python - <<PY
@@ -327,8 +412,8 @@ cd "${EVAL_DIR}"
 HLE_EXAMPLE_PATH="${HLE_EXAMPLE_PATH:-${EVAL_DIR}/hle.jsonl}"
 
 set +e
-timeout "${EVAL_TIMEOUT_MIN}m" bash -lc "source ~/miniconda3/etc/profile.d/conda.sh && conda activate '${BASELINE_CONDA_ENV}' && \
-  python eval_hle_local.py \
+timeout --signal=TERM --kill-after=30s "${EVAL_TIMEOUT_MIN}m" bash -lc "source ~/miniconda3/etc/profile.d/conda.sh && conda activate '${BASELINE_CONDA_ENV}' && \
+  exec python eval_hle_local.py \
     --model_name '${CKPT_DIR}' \
     --output_dir '${OUT_DIR}/outputs' \
     --model_config '${MODEL_CONFIG_PATH}' \
@@ -337,7 +422,7 @@ timeout "${EVAL_TIMEOUT_MIN}m" bash -lc "source ~/miniconda3/etc/profile.d/conda
     --max_rounds 50 \
     --log_level PROFILE \
     --log_file '${LOG_DIR}/hle_profile.log' \
-  " 2>&1 | tee "${EVAL_LOG}"
+  " 2>&1 | tee -a "${EVAL_LOG}"
 EVAL_RC=${PIPESTATUS[0]}
 set -e
 echo "[eval] exit_code=${EVAL_RC} (expected 124 if timed out)"

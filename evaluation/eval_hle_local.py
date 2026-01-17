@@ -24,6 +24,7 @@ import traceback
 import uuid
 from tqdm import tqdm
 from transformers import AutoTokenizer
+from functools import lru_cache
 import sys
 
 # HuggingFace Hub fast-download mode (`HF_HUB_ENABLE_HF_TRANSFER=1`) requires `hf_transfer`.
@@ -65,7 +66,13 @@ TOOL_PRICING = None
 vllm_model_configs = None
 with open('tools.json') as f:
     raw_tools = json.load(f)
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+
+HLE_TOKENIZER_NAME = os.environ.get("HLE_TOKENIZER_NAME") or "Qwen/Qwen3-8B"
+
+
+@lru_cache(maxsize=1)
+def get_tokenizer():
+    return AutoTokenizer.from_pretrained(HLE_TOKENIZER_NAME)
 
 # Together routing for open-source expert models (see /workspace/HLE-expert-lm.md)
 # IMPORTANT: Together dedicated endpoints must be called using the endpoint **Name** (e.g. "HK123/..."),
@@ -165,6 +172,7 @@ def cut_seq(seq,l):
             'effective_length': 0,
             'string_after_cut': ''
         }
+    tokenizer = get_tokenizer()
     token_ids = tokenizer(seq)['input_ids']
     rs = tokenizer.batch_decode(token_ids[-l:], skip_special_tokens=True)
     return {
@@ -667,7 +675,7 @@ def run_single(e):
         if not code_attempt_str.startswith('```') and len(code_attempt_str)>0:
             code_attempt_str = '```\n'+code_attempt_str
         doc_flag = False
-        problem_length = len(tokenizer(problem)['input_ids'])
+        problem_length = len(get_tokenizer()(problem)['input_ids'])
         if code_attempt_str_len<27000-problem_length:
             if code_attempt_str:
                 context_str = cut_seq(seq=doc_str+"\npython code and execution outputs:\n"+code_attempt_str,l=27000-problem_length)
@@ -821,7 +829,7 @@ def run_single(e):
                 code_str_len = str_cut['effective_length']
                 if not code_str.startswith('```') and len(code_str)>0:
                     code_str = '```\n'+code_str
-                problem_len = len(tokenizer(user_problem)['input_ids'])
+                problem_len = len(get_tokenizer()(user_problem)['input_ids'])
                 context_str = cut_seq(seq=doc_str+code_str,l=max_context_length-problem_len)
                 context_str = context_str['string_after_cut']
                 if len(doc_str)>0:
@@ -864,7 +872,7 @@ def run_single(e):
                 code_str_len = str_cut['effective_length']
                 if not code_str.startswith('```') and len(code_str)>0:
                     code_str = '```\n'+code_str
-                problem_len = len(tokenizer(user_problem)['input_ids'])
+                problem_len = len(get_tokenizer()(user_problem)['input_ids'])
                 context_str = cut_seq(seq=doc_str+code_str,l=max_context_length-problem_len)
                 context_str = context_str['string_after_cut']
                 if len(doc_str)>0:
@@ -909,7 +917,7 @@ def run_single(e):
                 code_str_len = str_cut['effective_length']
                 if not code_str.startswith('```') and len(code_str)>0:
                     code_str = '```\n'+code_str
-                problem_len = len(tokenizer(user_problem)['input_ids'])
+                problem_len = len(get_tokenizer()(user_problem)['input_ids'])
                 context_str = cut_seq(seq=doc_str+code_str,l=max_context_length-problem_len)
                 context_str = context_str['string_after_cut']
                 if len(doc_str)>0:
