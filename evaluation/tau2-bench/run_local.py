@@ -201,6 +201,7 @@ def get_available_gpus() -> int:
 def run_evaluation(domain: str, agent_llm: str, user_llm: str,
                    task_path: str, output_file: str, model_config_path: str,
                    max_steps: int = 200, num_trials: int = 1,
+                   num_repeats: int = 1,
                    use_model_tool: bool = False, max_concurrency: int = 10,
                    num_tasks: Optional[int] = None, max_errors: int = 10,
                    seed: int = 300, log_level: str = "ERROR",
@@ -451,6 +452,12 @@ Example usage:
         help="Number of trials per task (default: 1)"
     )
     parser.add_argument(
+        "--num-repeats",
+        type=int,
+        default=1,
+        help="Repeat the full evaluation N times (default: 1). This increases runtime without adding randomness."
+    )
+    parser.add_argument(
         "--num-tasks",
         type=int,
         default=None,
@@ -649,7 +656,7 @@ Example usage:
             n = _count_tasks_in_file(task_paths[domain])
             if args.num_tasks is not None:
                 n = min(n, args.num_tasks)
-            overall_total += n * args.num_trials
+            overall_total += n * args.num_trials * max(1, int(args.num_repeats))
 
         overall_state: Dict[str, Any] = {
             "total": overall_total,
@@ -657,37 +664,40 @@ Example usage:
             "start_ts": time.time(),
         }
 
-        results = {}
-        for domain in args.domains:
-            output_file = os.path.join(args.output_dir, f"{domain}.json")
+        results: Dict[str, str] = {}
+        repeats = max(1, int(args.num_repeats))
+        for rep in range(1, repeats + 1):
+            for domain in args.domains:
+                output_file = os.path.join(args.output_dir, f"{domain}_rep{rep}.json")
 
-            returncode = run_evaluation(
-                domain=domain,
-                agent_llm=args.agent_model,
-                user_llm=args.user_llm,
-                task_path=task_paths[domain],
-                output_file=output_file,
-                model_config_path=args.model_config_path,
-                max_steps=args.max_steps,
-                num_trials=args.num_trials,
-                use_model_tool=args.use_model_tool,
-                max_concurrency=args.max_concurrency,
-                num_tasks=args.num_tasks,
-                max_errors=args.max_errors,
-                seed=args.seed,
-                log_level=args.log_level,
-                log_dir=args.log_dir,
-                overall_state=overall_state,
-            )
+                returncode = run_evaluation(
+                    domain=domain,
+                    agent_llm=args.agent_model,
+                    user_llm=args.user_llm,
+                    task_path=task_paths[domain],
+                    output_file=output_file,
+                    model_config_path=args.model_config_path,
+                    max_steps=args.max_steps,
+                    num_trials=args.num_trials,
+                    num_repeats=args.num_repeats,
+                    use_model_tool=args.use_model_tool,
+                    max_concurrency=args.max_concurrency,
+                    num_tasks=args.num_tasks,
+                    max_errors=args.max_errors,
+                    seed=args.seed,
+                    log_level=args.log_level,
+                    log_dir=args.log_dir,
+                    overall_state=overall_state,
+                )
 
-            results[domain] = "SUCCESS" if returncode == 0 else "FAILED"
+                results[f"{domain}:rep{rep}"] = "SUCCESS" if returncode == 0 else "FAILED"
 
         # Print summary
         log("\n" + "="*60)
         log("EVALUATION SUMMARY")
         log("="*60)
-        for domain, status in results.items():
-            log(f"{domain.upper()}: {status}")
+        for k, status in results.items():
+            log(f"{k.upper()}: {status}")
         log("="*60)
 
     finally:

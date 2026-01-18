@@ -10,6 +10,13 @@ EXPERT_2_IP="${3:-}"
 EXPERT_3_IP="${4:-}"
 SCHEDULER="${5:-baseline}"
 
+# NOTE: Orchestrator backends (ports 8100+) are typically bound to localhost on the orchestrator node
+# (router talks to http://localhost:810x). When this script runs from a different node, probing
+# ${ORCH_IP}:810x will often fail even if the system is healthy. Therefore backend checks are
+# optional by default.
+CHECK_ORCH_BACKENDS="${CHECK_ORCH_BACKENDS:-0}"
+REQUIRE_ORCH_BACKENDS="${REQUIRE_ORCH_BACKENDS:-0}"
+
 check_endpoint() {
     local ip=$1
     local port=$2
@@ -31,15 +38,29 @@ if [[ -n "${ORCH_IP}" ]]; then
     echo "=== Checking Orchestrator (${SCHEDULER}) ==="
     if [[ "${SCHEDULER}" == "thunderreact" ]]; then
         check_endpoint "${ORCH_IP}" 8000 "ThunderReact Router" || FAILED=1
-        # Also check backends
-        echo "--- Checking ThunderReact backends ---"
-        for port in 8100 8101 8102 8103 8104 8105 8106 8107; do
-            check_endpoint "${ORCH_IP}" "${port}" "Backend" || true  # Don't fail on backend checks
-        done
     else
-        for port in 1900 1901 1902 1903 1904 1905 1906 1907; do
-            check_endpoint "${ORCH_IP}" "${port}" "Orchestrator" || FAILED=1
+        check_endpoint "${ORCH_IP}" 8000 "vllm-router" || FAILED=1
+    fi
+
+    if [[ "${CHECK_ORCH_BACKENDS}" -eq 1 ]]; then
+        # Best-effort only; do not fail unless REQUIRE_ORCH_BACKENDS=1.
+        echo "--- Checking Orchestrator backends (best effort) ---"
+        ANY_BACKEND_OK=0
+        for port in 8100 8101 8102 8103 8104 8105 8106 8107; do
+            if check_endpoint "${ORCH_IP}" "${port}" "Backend" 2; then
+                ANY_BACKEND_OK=1
+            fi
         done
+        if [[ "${ANY_BACKEND_OK}" -eq 0 ]]; then
+            if [[ "${REQUIRE_ORCH_BACKENDS}" -eq 1 ]]; then
+                echo "[FAIL] No orchestrator backends responded on ports 8100-8107 (REQUIRE_ORCH_BACKENDS=1)"
+                FAILED=1
+            else
+                echo "[WARN] No orchestrator backends responded on ports 8100-8107 (likely bound to localhost); continuing"
+            fi
+        fi
+    else
+        echo "--- Skipping orchestrator backend checks (CHECK_ORCH_BACKENDS=0) ---"
     fi
 fi
 
@@ -62,9 +83,13 @@ fi
 if [[ -n "${EXPERT_3_IP}" ]]; then
     echo ""
     echo "=== Checking Expert-3 (Qwen3-Next-80B) at ${EXPERT_3_IP} ==="
-    for port in 1920 1921; do
-        check_endpoint "${EXPERT_3_IP}" "${port}" "Expert-3" || FAILED=1
-    done
+    if [[ -n "${TOGETHER_API_KEY:-}" ]]; then
+        echo "[SKIP] TOGETHER_API_KEY set; expert-3 may be routed via Together (no local /health)."
+    else
+        for port in 1920 1921; do
+            check_endpoint "${EXPERT_3_IP}" "${port}" "Expert-3" || FAILED=1
+        done
+    fi
 fi
 
 echo ""

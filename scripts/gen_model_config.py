@@ -5,7 +5,7 @@ Usage:
     # For ThunderReact (single router endpoint)
     python gen_model_config.py <orch_ip> <expert_1_ip> <expert_2_ip> <expert_3_ip> --scheduler thunderreact
 
-    # For Baseline/Continuum (DP=8 endpoints)
+    # For Baseline/Continuum (single router endpoint via vllm-router)
     python gen_model_config.py <orch_ip> <expert_1_ip> <expert_2_ip> <expert_3_ip> --scheduler baseline
 
     # Override orchestrator endpoints (useful for 5090 single-GPU runs):
@@ -48,8 +48,8 @@ def main() -> int:
         epilog="""
 Node Configuration:
   Node 1 (Orchestrator): Nemotron-Orchestrator-8B (DP=8)
-    - Baseline/Continuum: ports 1900-1907
-    - ThunderReact: router on port 8000
+    - ThunderReact: ThunderReact router on port 8000
+    - Baseline/Continuum: vllm-router on port 8000
 
   Node 2 (Expert-1): openai/gpt-oss-20b (TP=2, DP=4)
     - Ports: 1910-1913
@@ -107,14 +107,11 @@ Node Configuration:
             spec = f"{args.orch_ip}:{args.orch_port}"
         orch_endpoints = _parse_orch_endpoints(spec)
     else:
-        if args.scheduler == "thunderreact":
-            # ThunderReact: single router endpoint on port 8000
-            orch_endpoints = [{"ip_addr": args.orch_ip, "port": "8000"}]
-        else:
-            # Baseline/Continuum: DP=8 endpoints on ports 1900-1907
-            orch_endpoints = [
-                {"ip_addr": args.orch_ip, "port": str(1900 + i)} for i in range(8)
-            ]
+        # Default: route ALL orchestrator requests through a router on port 8000.
+        # - ThunderReact: ThunderReact router
+        # - Baseline: vllm-router (session routing)
+        # - Continuum: vllm-router (session routing) + continuum backends
+        orch_endpoints = [{"ip_addr": args.orch_ip, "port": "8000"}]
 
     config = {
         # Orchestrator-8B endpoints

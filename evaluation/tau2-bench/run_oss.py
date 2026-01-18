@@ -66,6 +66,7 @@ def _close_driver_log():
 def _emit_task_complete_marker(
     *,
     domain: str,
+    repeat: int,
     trial: int,
     task_id: str,
     status: str,
@@ -73,10 +74,13 @@ def _emit_task_complete_marker(
     total_global: int,
 ) -> None:
     # Machine-parsable marker for downstream throughput/ETA analysis.
+    ts_unix = int(time.time())
+    ts_iso = datetime.now().isoformat(timespec="seconds")
     line = (
         "[TAU2_TASK_COMPLETE] "
-        f"domain={domain} trial={trial} task_id={task_id} status={status} "
-        f"completed_global={completed_global} total_global={total_global}",
+        f"ts_iso={ts_iso} ts_unix={ts_unix} "
+        f"repeat={repeat} domain={domain} trial={trial} task_id={task_id} status={status} "
+        f"completed_global={completed_global} total_global={total_global}"
     )
     print(line, flush=True)
     fh = globals().get("_DRIVER_LOG_FH")
@@ -94,24 +98,48 @@ def _round_robin_items(
     *,
     num_trials: int,
     trial_seeds: List[int],
+    trial_order: str = "task-major",
 ) -> List[Tuple[str, Any, int, int]]:
     """
     Build a global queue of (domain, task, trial, seed) in round-robin order.
     This ensures different domains' tasks interleave.
+
+    trial_order:
+      - "task-major" (default): schedule all trials of the same task consecutively
+        (task0:trial0..N, task1:trial0..N, ...).
+      - "trial-major": schedule all tasks for trial0, then all tasks for trial1, ...
     """
     items: List[Tuple[str, Any, int, int]] = []
-    for trial in range(num_trials):
+    if trial_order not in ("task-major", "trial-major"):
+        raise ValueError(f"Invalid trial_order={trial_order!r} (expected 'task-major' or 'trial-major')")
+
+    if trial_order == "task-major":
         per_domain_idx = {d: 0 for d in domains}
         while True:
             progressed = False
             for d in domains:
                 idx = per_domain_idx[d]
                 if idx < len(tasks_by_domain.get(d, [])):
-                    items.append((d, tasks_by_domain[d][idx], trial, trial_seeds[trial]))
+                    task = tasks_by_domain[d][idx]
+                    for trial in range(num_trials):
+                        items.append((d, task, trial, trial_seeds[trial]))
                     per_domain_idx[d] = idx + 1
                     progressed = True
             if not progressed:
                 break
+    else:
+        for trial in range(num_trials):
+            per_domain_idx = {d: 0 for d in domains}
+            while True:
+                progressed = False
+                for d in domains:
+                    idx = per_domain_idx[d]
+                    if idx < len(tasks_by_domain.get(d, [])):
+                        items.append((d, tasks_by_domain[d][idx], trial, trial_seeds[trial]))
+                        per_domain_idx[d] = idx + 1
+                        progressed = True
+                if not progressed:
+                    break
     return items
 
 
@@ -130,10 +158,13 @@ def run_global_evaluation(
     log_dir: str,
     max_steps: int,
     num_trials: int,
+    num_repeats: int,
     num_tasks: Optional[int],
     max_concurrency: int,
     use_model_tool: bool,
     log_level: str,
+    temperature: float = 1.0,
+    trial_order: str = "task-major",
     max_errors: int = 10,
     seed: int = 300,
 ) -> int:
@@ -166,7 +197,9 @@ def run_global_evaluation(
         # Configure tau2 structured logging to a single file.
         configure_logging(level=log_level, file_handler=tau2_log_path)
 
-        # Deterministic per-trial seeds (matches tau2/run.py behavior)
+        # Deterministic per-trial seeds (matches tau2/run.py behavior).
+        # NOTE: For repeats, we intentionally reuse the same per-trial seeds across repeats
+        # so "repeat" increases workload without introducing new randomness.
         random.seed(seed)
         trial_seeds = [random.randint(0, 1000000) for _ in range(num_trials)]
 
@@ -179,18 +212,32 @@ def run_global_evaluation(
         # Load tasks per domain (domain-specific loaders via registry)
         tasks_by_domain: Dict[str, List[Any]] = {}
         total_tasks = 0
+        repeats = max(1, int(num_repeats))
         for d in domains:
             tpath = task_paths[d]
             tasks = get_tasks(task_set_name=d, task_ids=None, num_tasks=num_tasks, task_path=tpath, save_to=output_file)
             tasks_by_domain[d] = tasks
-            total_tasks += len(tasks) * num_trials
+            total_tasks += len(tasks) * num_trials * repeats
             log(f"Loaded tasks: domain={d} tasks={len(tasks)} trials={num_trials} path={tpath}")
         if total_tasks <= 0:
             log("ERROR: No tasks to run after loading (check task files / num-tasks).")
             return 2
 
         # Build a global schedule in round-robin order.
-        items = _round_robin_items(tasks_by_domain, domains, num_trials=num_trials, trial_seeds=trial_seeds)
+        base_items = _round_robin_items(
+            tasks_by_domain,
+            domains,
+            num_trials=num_trials,
+            trial_seeds=trial_seeds,
+            trial_order=trial_order,
+        )
+
+        # Ordering: repeat -> task -> trial (as long as trial_order == "task-major").
+        items: List[Tuple[int, str, Any, int, int]] = []
+        for rep in range(repeats):
+            for d, task, trial, trial_seed in base_items:
+                items.append((rep, d, task, trial, trial_seed))
+
         assert len(items) == total_tasks, f"internal error: scheduled={len(items)} total={total_tasks}"
 
         log(f"Scheduling mode: global (round-robin) total_tasks={total_tasks} max_concurrency={max_concurrency}")
@@ -202,11 +249,11 @@ def run_global_evaluation(
 
         lock = threading.Lock()
 
-        def _run_one(item: Tuple[str, Any, int, int]) -> Tuple[str, str, int, str, Optional[float]]:
-            domain, task, trial, trial_seed = item
+        def _run_one(item: Tuple[int, str, Any, int, int]) -> Tuple[int, str, str, int, str, Optional[float]]:
+            repeat, domain, task, trial, trial_seed = item
             task_id = getattr(task, "id", "unknown")
             # Include domain in the visible task id for logs (single global log file).
-            set_task_context(f"{domain}:{task_id}", domain)
+            set_task_context(f"r{repeat}:{domain}:{task_id}", domain)
             status = "ok"
             reward_val: Optional[float] = None
             try:
@@ -216,7 +263,7 @@ def run_global_evaluation(
                     agent="llm_agent",
                     user="user_simulator",
                     llm_agent=agent_llm,
-                    llm_args_agent=dict(DEFAULT_LLM_ARGS_AGENT),
+                    llm_args_agent={**dict(DEFAULT_LLM_ARGS_AGENT), "temperature": float(temperature)},
                     llm_user=user_llm,
                     llm_args_user=dict(DEFAULT_LLM_ARGS_USER),
                     max_steps=max_steps,
@@ -237,11 +284,11 @@ def run_global_evaluation(
                 log(f"Task failed: domain={domain} task_id={task_id} trial={trial} error={e}")
             finally:
                 clear_task_context()
-            return domain, str(task_id), trial, status, reward_val
+            return repeat, domain, str(task_id), trial, status, reward_val
 
         # Submit tasks incrementally to enforce global max_concurrency without huge future queues.
-        it: Iterator[Tuple[str, Any, int, int]] = iter(items)
-        in_flight: Dict[Future, Tuple[str, Any, int, int]] = {}
+        it: Iterator[Tuple[int, str, Any, int, int]] = iter(items)
+        in_flight: Dict[Future, Tuple[int, str, Any, int, int]] = {}
 
         with ThreadPoolExecutor(max_workers=max_concurrency) as ex:
             # Prime the pool
@@ -256,16 +303,16 @@ def run_global_evaluation(
                 done_set, _pending = wait(set(in_flight.keys()), return_when=FIRST_COMPLETED)
                 for done_future in done_set:
                     item = in_flight.pop(done_future)
-                    domain, task, trial, _trial_seed = item
+                    repeat, domain, task, trial, _trial_seed = item
                     task_id = getattr(task, "id", "unknown")
 
                     status = "error"
                     reward_val: Optional[float] = None
                     try:
-                        _d, _tid, _tr, status, reward_val = done_future.result()
+                        _rep, _d, _tid, _tr, status, reward_val = done_future.result()
                     except Exception as e:
                         status = "error"
-                        log(f"Task future raised: domain={domain} task_id={task_id} trial={trial} error={e}")
+                        log(f"Task future raised: repeat={repeat} domain={domain} task_id={task_id} trial={trial} error={e}")
 
                     with lock:
                         completed += 1
@@ -276,6 +323,7 @@ def run_global_evaluation(
 
                         _emit_task_complete_marker(
                             domain=domain,
+                            repeat=repeat,
                             trial=trial,
                             task_id=str(task_id),
                             status=status,
@@ -284,7 +332,7 @@ def run_global_evaluation(
                         )
 
                     # Write per-task summary (single directory, not per-domain)
-                    out_name = f"{_safe_filename(domain)}__{_safe_filename(str(task_id))}__trial{trial}.json"
+                    out_name = f"{_safe_filename(domain)}__{_safe_filename(str(task_id))}__r{repeat}__trial{trial}.json"
                     out_path = os.path.join(save_dir, out_name)
                     try:
                         with open(out_path, "w", encoding="utf-8") as f:
@@ -292,6 +340,7 @@ def run_global_evaluation(
                                 {
                                     "domain": domain,
                                     "task_id": str(task_id),
+                                    "repeat": int(repeat),
                                     "trial": int(trial),
                                     "status": status,
                                     "reward": reward_val,
@@ -814,6 +863,7 @@ def run_evaluation(
     model_config_path: str,
     max_steps: int = 200,
     num_trials: int = 1,
+    temperature: float = 1.0,
     use_model_tool: bool = True,
     max_concurrency: int = 10,
     num_tasks: Optional[int] = None,
@@ -850,6 +900,8 @@ def run_evaluation(
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    # Allow the parent driver to override agent sampling temperature for subprocess mode.
+    env["TAU2_AGENT_TEMPERATURE"] = str(temperature)
 
     os.makedirs(log_dir, exist_ok=True)
     env["TAU2_LOG_FILE"] = os.path.join(log_dir, f"tau2_{domain}.log")
@@ -1053,6 +1105,25 @@ Example usage:
         help="Number of trials per task (default: 1)"
     )
     parser.add_argument(
+        "--num-repeats",
+        type=int,
+        default=1,
+        help="Repeat the full (tasks x trials) schedule this many times (default: 1). Repeats reuse the same per-trial seeds.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for agent LLM (default: 1.0)"
+    )
+    parser.add_argument(
+        "--trial-order",
+        type=str,
+        choices=["trial-major", "task-major"],
+        default="task-major",
+        help="Trial scheduling order. task-major groups the same task's trials together (default: task-major)."
+    )
+    parser.add_argument(
         "--num-tasks",
         type=int,
         default=None,
@@ -1250,10 +1321,13 @@ Example usage:
             log_dir=args.log_dir,
             max_steps=args.max_steps,
             num_trials=args.num_trials,
+            num_repeats=args.num_repeats,
             num_tasks=args.num_tasks,
             max_concurrency=args.max_concurrency,
             use_model_tool=args.use_model_tool,
             log_level=args.log_level,
+            temperature=args.temperature,
+            trial_order=args.trial_order,
         )
         results["global"] = "SUCCESS" if rc == 0 else "FAILED"
     else:
@@ -1296,6 +1370,7 @@ Example usage:
                 model_config_path=args.model_config_path,
                 max_steps=args.max_steps,
                 num_trials=args.num_trials,
+                temperature=args.temperature,
                 use_model_tool=args.use_model_tool,
                 max_concurrency=args.max_concurrency,
                 num_tasks=args.num_tasks,

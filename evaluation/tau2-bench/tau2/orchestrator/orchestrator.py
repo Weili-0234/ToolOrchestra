@@ -99,6 +99,10 @@ class Orchestrator:
         if isinstance(llm_args, dict):
             llm_args["job_id"] = job_id
             llm_args["is_last_step"] = is_last_step
+            # ThunderReact-new uses `program_id` as the routing key.
+            # We map program_id := job_id so existing tau2 job_id semantics are preserved.
+            if os.getenv("TAU2_TRNEW", "0") == "1":
+                llm_args["program_id"] = job_id
 
     def _release_router_job(self) -> None:
         """Release job from ThunderReact router when task completes."""
@@ -108,12 +112,22 @@ class Orchestrator:
         if not router_url:
             return
         try:
-            resp = requests.post(
-                f"{router_url.rstrip('/')}/programs/release",
-                json={"job_id": self.job_id},
-                timeout=2.0,
-            )
-            resp.raise_for_status()
+            url = f"{router_url.rstrip('/')}/programs/release"
+            # TR-new expects {"program_id": ...}; the legacy router expects {"job_id": ...}.
+            if os.getenv("TAU2_TRNEW", "0") == "1":
+                primary = {"program_id": self.job_id}
+                fallback = {"job_id": self.job_id}
+            else:
+                primary = {"job_id": self.job_id}
+                fallback = {"program_id": self.job_id}
+
+            resp = requests.post(url, json=primary, timeout=2.0)
+            if resp.status_code >= 400:
+                # Best-effort backward/forward compatibility across router implementations.
+                resp2 = requests.post(url, json=fallback, timeout=2.0)
+                resp2.raise_for_status()
+            else:
+                resp.raise_for_status()
             self.router_released = True
         except Exception as exc:
             logger.warning(f"Failed to release job_id={self.job_id}: {exc}")

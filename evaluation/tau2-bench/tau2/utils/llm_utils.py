@@ -475,9 +475,13 @@ def generate(
 
     # Router / scheduler fields (ThunderReact / Continuum)
     job_id = kwargs.pop("job_id", None)
+    # ThunderReact-new uses `program_id` (we map program_id := job_id upstream when enabled).
+    program_id = kwargs.pop("program_id", None)
     is_last_step = kwargs.pop("is_last_step", False)
     last_func_call = kwargs.pop("last_func_call", None)
     extra_body: dict[str, Any] = {}
+    if program_id:
+        extra_body["program_id"] = program_id
     if job_id:
         extra_body["job_id"] = job_id
         extra_body["is_last_step"] = bool(is_last_step)
@@ -551,7 +555,15 @@ def generate(
     
     # Determine call type for logging
     call_type = "unknown"
-    if 'qwen' in model.lower() or 'huggingface' in model.lower() or 'llama' in model.lower() or 'nemotron' in model.lower() or 'orchestrator' in model.lower():
+    model_l = model.lower()
+    if (
+        "gpt-oss" in model_l
+        or "qwen" in model_l
+        or "huggingface" in model_l
+        or "llama" in model_l
+        or "nemotron" in model_l
+        or "orchestrator" in model_l
+    ):
         call_type = "vllm"
     elif 'claude' in model.lower():
         call_type = "claude"
@@ -559,12 +571,79 @@ def generate(
         call_type = "openai"
     else:
         call_type = "openai"  # default to openai for other models
-    if role=='assistant' and ('qwen' in model.lower() or 'huggingface' in model.lower() or 'llama' in model.lower() or 'nemotron' in model.lower() or 'orchestrator' in model.lower()):
+
+    def _get_vllm_model_config(cfg: dict, m: str):
+        if m in cfg:
+            return m, cfg[m]
+        # Common pitfall: filesystem paths may/may-not end with a trailing slash.
+        try:
+            if os.path.exists(m):
+                m_strip = m.rstrip("/")
+                m_slash = m_strip + "/"
+                if m_slash in cfg:
+                    return m_slash, cfg[m_slash]
+                if m_strip in cfg:
+                    return m_strip, cfg[m_strip]
+        except Exception:
+            pass
+        return None, None
+
+    # For vLLM-served OSS models used as user_simulator/evaluator (e.g. openai/gpt-oss-*),
+    # route through model_config_path as well; otherwise it falls back to OpenAI and may return None.
+    handled_nonassistant_vllm = False
+    if role != "assistant" and call_type == "vllm" and model_config_path:
+        try:
+            with open(model_config_path) as f:
+                cfg = json.load(f)
+            _, model_config = _get_vllm_model_config(cfg, model)
+        except Exception:
+            model_config = None
+        if model_config:
+            config_idx = random.randint(0, len(model_config) - 1)
+            tools_length = len(tokenizer(str(tools))["input_ids"]) if tools else 0
+            updated_messages = cut_middle_turns(tokenizer=tokenizer, messages=litellm_messages, max_length=23000 - tools_length)
+            try:
+                response = get_llm_response(
+                    model=model,
+                    messages=updated_messages,
+                    tools=tools,
+                    return_raw_response=True,
+                    temperature=1,
+                    model_config=model_config,
+                    model_config_path=model_config_path,
+                    model_config_idx=config_idx,
+                    model_type="vllm",
+                    max_length=8000,
+                    extra_body=extra_body if extra_body else None,
+                )
+            except (ContextLengthExceededError, MaxRetriesExceededError, LLMTimeoutError) as e:
+                tau2_logger.error(f"LLM call failed permanently (vLLM user/evaluator path): {type(e).__name__}: {e}")
+                try:
+                    llm_timer.__exit__(None, None, None)
+                except Exception:
+                    pass
+                return AssistantMessage(
+                    content=f"###STOP### (LLM_ERROR: {type(e).__name__})",
+                    tool_calls=None,
+                )
+            response_content = "Wait a minute, I will take it very soon"
+            if not isinstance(response, str) and response and getattr(response, "choices", None):
+                try:
+                    response_content = _extract_message_text(response.choices[0].message)
+                except Exception:
+                    response_content = "Wait a minute, I will take it very soon"
+            response = {"content": response_content, "tool_calls": []}
+            handled_nonassistant_vllm = True
+
+    if not handled_nonassistant_vllm and role=='assistant' and ('gpt-oss' in model.lower() or 'qwen' in model.lower() or 'huggingface' in model.lower() or 'llama' in model.lower() or 'nemotron' in model.lower() or 'orchestrator' in model.lower()):
         # Local model path: always route through local vLLM using model_config_path.
         # Previously, 'nemotron' models were hard-coded to 'nv/dev' (Together API),
         # which makes local runs hang/idly wait and never hit vLLM.
         with open(model_config_path) as f:
-            model_config = json.load(f)[model]
+            cfg = json.load(f)
+        _, model_config = _get_vllm_model_config(cfg, model)
+        if not model_config:
+            raise KeyError(f"Missing vLLM model config for model={model} (model_config_path={model_config_path})")
         config_idx = random.randint(0, len(model_config)-1)
         if use_model_tool:
             updated_tools = []
@@ -637,6 +716,7 @@ def generate(
                 tool_calls=None,
             )
         mode_to_call = None
+        expert_choice = None
         tool_calls = []
         input_tokens = 0
         output_tokens = 0
@@ -693,11 +773,16 @@ def generate(
                             elif expert_choice == 'expert-2':
                                 mode_to_call = 'gpt-5-mini'
                             elif expert_choice == 'expert-3':
-                                mode_to_call = 'Qwen/Qwen3-32B'
+                                # OSS expert-3 (local vLLM default; may be overridden to Together)
+                                mode_to_call = 'Qwen/Qwen3-Next-80B-A3B-Instruct-FP8'
                 tool_calls.append({
                         'name': one_tool_call.function.name,
                         'arguments': one_tool_call_arguments
                     })
+        # Force expert-3 to Together AI backend when TOGETHER_API_KEY is set.
+        # This intentionally overrides any local OSS mapping for expert-3 (e.g. FP8 vLLM ports).
+        if expert_choice == "expert-3" and os.getenv("TOGETHER_API_KEY"):
+            mode_to_call = "Qwen/Qwen3-Next-80B-A3B-Instruct"
         expert_model = mode_to_call
         if mode_to_call:
             # Time the expert call separately
@@ -715,15 +800,33 @@ def generate(
             expert_enable_thinking = not ('qwen3' in mode_to_call.lower())
             llm_messages = to_litellm_messages(messages,model=mode_to_call,use_model_tool=False,domain=domain,role=role,enable_thinking=expert_enable_thinking)
 
-            # Determine expert call type based on model
+            # Determine expert call type based on model.
+            # Expert-3 can be routed to Together AI (OpenAI-compatible) if TOGETHER_API_KEY is set.
+            use_together_expert3 = (
+                expert_choice == "expert-3"
+                and bool(os.getenv("TOGETHER_API_KEY"))
+            )
             is_openai_api = 'gpt-5' in mode_to_call and 'gpt-oss' not in mode_to_call.lower()
             is_vllm_oss = 'gpt-oss' in mode_to_call.lower() or 'qwen3' in mode_to_call.lower()
-            expert_call_type = "openai" if is_openai_api else "vllm"
+            expert_call_type = "together" if use_together_expert3 else ("openai" if is_openai_api else "vllm")
 
             try:
                 if is_openai_api:
                     # Proprietary OpenAI models (gpt-5, gpt-5-mini)
                     response = get_llm_response(model=mode_to_call,messages=llm_messages,tools=original_tools,return_raw_response=True,max_length=40000,extra_body=extra_body if extra_body else None)
+                elif expert_call_type == "together":
+                    # Expert-3 via Together AI (OpenAI-compatible API)
+                    tools_length = len(tokenizer(str(original_tools))['input_ids'])
+                    cut_messages = cut_middle_turns(tokenizer=tokenizer,messages=litellm_messages,max_length=23000-tools_length)
+                    response = get_llm_response(
+                        model=mode_to_call,
+                        messages=cut_messages,
+                        tools=original_tools,
+                        return_raw_response=True,
+                        model_type="together",
+                        max_length=8000,
+                        extra_body=extra_body if extra_body else None,
+                    )
                 elif is_vllm_oss:
                     # OSS models via local vLLM (gpt-oss-*, qwen3-*, qwen3-next-*)
                     # Default OFF; enable explicitly via TAU2_EXPERT_STREAM_PROFILE=1.
@@ -804,7 +907,7 @@ def generate(
             'content': response_content,
             'tool_calls': tool_calls,
         }
-    elif 'claude' in model.lower():
+    elif not handled_nonassistant_vllm and 'claude' in model.lower():
         try:
             response = get_llm_response(
                 model=model,
@@ -852,7 +955,7 @@ def generate(
             'content': response_content,
             'tool_calls': tool_calls,
         }
-    else:
+    elif not handled_nonassistant_vllm:
         try:
             if os.getenv("TAU2_TRACE", "0") == "1":
                 print(
@@ -881,7 +984,14 @@ def generate(
                 tool_calls=None,
             )
         tool_calls = []
-        if not isinstance(response,str) and response.choices[0].message.tool_calls:
+        if (
+            not isinstance(response, str)
+            and response
+            and getattr(response, "choices", None)
+            and response.choices
+            and getattr(response.choices[0], "message", None) is not None
+            and getattr(response.choices[0].message, "tool_calls", None)
+        ):
             for one_tool_call in response.choices[0].message.tool_calls:
                 tool_calls.append({
                     'name': one_tool_call.function.name,
@@ -889,7 +999,7 @@ def generate(
                 })
         input_tokens = 0
         output_tokens = 0
-        if isinstance(response,str) or not response:
+        if isinstance(response, str) or not response or not getattr(response, "choices", None):
             response_content = "Wait a minute, I will take it very soon"
         else:
             response_content = _extract_message_text(response.choices[0].message)
