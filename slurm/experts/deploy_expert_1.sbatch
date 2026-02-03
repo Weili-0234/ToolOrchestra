@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --partition batch
-#SBATCH --time 48:00:00
+#SBATCH --time 96:00:00
 #SBATCH --nodes 1
 #SBATCH --gpus-per-node=8
 #SBATCH --exclusive

@@ -16,7 +16,10 @@ Outputs JSON with:
     - /metrics-based token-weighted hit ratio (Δhits/Δqueries)
     - /metrics-based preemption severity (Δnum_preemptions per interval + per-sec)
     - response-usage-based cached_tokens/prompt_tokens ratio (token-weighted + request-avg)
+    - request throughput from orchestrator_usage.jsonl (requests/sec, requests/min)
     - trials/sec in the same window (if eval log provided)
+    - steps/sec in the same window (if eval log provided)
+    - tasks/sec in the same window (if trials.jsonl provided with num_trials)
 """
 
 from __future__ import annotations
@@ -31,6 +34,23 @@ from typing import Any, Dict, List, Optional
 
 
 def _read_usage_jsonl(path: Path) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not path.exists():
+        return out
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def _read_trials_jsonl(path: Path) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     if not path.exists():
         return out
@@ -230,9 +250,15 @@ def _summarize_usage_recs(usage_recs: List[Dict[str, Any]], t_start: float, t_en
         ratios.append(ct / pt)
     ratio_token_weighted = (sum_cached / sum_prompt) if sum_prompt > 0 else None
     ratio_request_avg = (sum(ratios) / len(ratios)) if ratios else None
+    window_dur = max(0.0, t_end - t_start)
+    requests_per_sec = (n / window_dur) if window_dur > 0 else None
+    requests_per_min = (requests_per_sec * 60.0) if requests_per_sec is not None else None
     return {
         "available": True,
         "responses": n,
+        "window_duration_sec": window_dur,
+        "requests_per_sec": requests_per_sec,
+        "requests_per_min": requests_per_min,
         "sum_cached_tokens": sum_cached,
         "sum_prompt_tokens": sum_prompt,
         "cached_tokens_ratio_token_weighted": ratio_token_weighted,
@@ -342,6 +368,103 @@ def _summarize_trials_with_fallback(eval_log: Path, t_start: float, t_end: float
     return best or {"available": False}
 
 
+def _summarize_steps_per_sec(eval_log: Path, t_start: float, t_end: float) -> Dict[str, Any]:
+    if not eval_log.exists():
+        return {"available": False}
+    count = 0
+    parsed = 0
+    ts_first: Optional[float] = None
+    ts_last: Optional[float] = None
+    for line in eval_log.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if "type=step_complete" not in line:
+            continue
+        ts = _parse_line_ts_unix(line)
+        if ts is None:
+            continue
+        parsed += 1
+        if t_start <= ts <= t_end:
+            count += 1
+            if ts_first is None or ts < ts_first:
+                ts_first = ts
+            if ts_last is None or ts > ts_last:
+                ts_last = ts
+    window_dur = max(0.0, t_end - t_start)
+    steps_per_sec = (count / window_dur) if window_dur > 0 else None
+    steps_per_min = (steps_per_sec * 60.0) if steps_per_sec is not None else None
+    return {
+        "available": True,
+        "marker_lines_parsed": parsed,
+        "steps_completed_in_window": count,
+        "window_duration_sec": window_dur,
+        "steps_per_sec": steps_per_sec,
+        "steps_per_min": steps_per_min,
+        "first_marker_unix": ts_first,
+        "last_marker_unix": ts_last,
+    }
+
+
+def _summarize_steps_with_fallback(eval_log: Path, t_start: float, t_end: float) -> Dict[str, Any]:
+    best: Optional[Dict[str, Any]] = None
+    for p in _candidate_eval_logs(eval_log):
+        cur = _summarize_steps_per_sec(p, t_start, t_end)
+        if not cur.get("available"):
+            continue
+        cur["source_log"] = str(p)
+        if best is None:
+            best = cur
+        if (cur.get("marker_lines_parsed") or 0) > 0:
+            return cur
+    return best or {"available": False}
+
+
+def _summarize_tasks_from_trials(
+    trials: List[Dict[str, Any]],
+    t_start: float,
+    t_end: float,
+    num_trials: Optional[int],
+) -> Dict[str, Any]:
+    if not trials or not num_trials or num_trials <= 0:
+        return {"available": False}
+    per_task: Dict[tuple, Dict[int, float]] = {}
+    for rec in trials:
+        try:
+            ts = float(rec.get("ts_unix"))
+            rep = int(rec.get("rep"))
+            task_id = str(rec.get("task_id"))
+            trial_idx = int(rec.get("trial"))
+        except Exception:
+            continue
+        key = (rep, task_id)
+        bucket = per_task.setdefault(key, {})
+        # Keep the latest completion time for a given trial index.
+        prev = bucket.get(trial_idx)
+        if prev is None or ts > prev:
+            bucket[trial_idx] = ts
+
+    completed = 0
+    total_tasks_with_all_trials = 0
+    window_dur = max(0.0, t_end - t_start)
+    for (_key, trials_by_idx) in per_task.items():
+        if len(trials_by_idx) < num_trials:
+            continue
+        total_tasks_with_all_trials += 1
+        task_done_ts = max(trials_by_idx.values())
+        if t_start <= task_done_ts <= t_end:
+            completed += 1
+
+    tasks_per_sec = (completed / window_dur) if window_dur > 0 else None
+    tasks_per_min = (tasks_per_sec * 60.0) if tasks_per_sec is not None else None
+    return {
+        "available": True,
+        "tasks_completed_in_window": completed,
+        "tasks_with_all_trials_total": total_tasks_with_all_trials,
+        "window_duration_sec": window_dur,
+        "tasks_per_sec": tasks_per_sec,
+        "tasks_per_min": tasks_per_min,
+        "num_trials": num_trials,
+    }
+
+
 def _iso(ts: float) -> str:
     return dt.datetime.fromtimestamp(ts).astimezone().replace(microsecond=0).isoformat()
 
@@ -351,6 +474,8 @@ def main() -> int:
     ap.add_argument("--metrics-csv", required=True)
     ap.add_argument("--usage-jsonl", required=True)
     ap.add_argument("--eval-log", default=None)
+    ap.add_argument("--trials-jsonl", default=None)
+    ap.add_argument("--num-trials", type=int, default=0)
     ap.add_argument("--out-json", default=None)
     ap.add_argument("--start-offset-sec", type=float, default=600.0)
     ap.add_argument("--end-offset-sec", type=float, default=7800.0)
@@ -365,8 +490,10 @@ def main() -> int:
     metrics_csv = Path(args.metrics_csv)
     usage_jsonl = Path(args.usage_jsonl)
     eval_log = Path(args.eval_log) if args.eval_log else None
+    trials_jsonl = Path(args.trials_jsonl) if args.trials_jsonl else None
 
     usage = _read_usage_jsonl(usage_jsonl)
+    trials = _read_trials_jsonl(trials_jsonl) if trials_jsonl else []
     t0 = _first_request_ts(usage)
     if t0 is None:
         out = {"ok": False, "reason": "no_t0", "usage_jsonl": str(usage_jsonl)}
@@ -401,6 +528,8 @@ def main() -> int:
                 "metrics": _summarize_metrics_csv(metrics_csv, t_start, t_end),
                 "response_usage": _summarize_usage_recs(usage, t_start, t_end),
                 "trials": _summarize_trials_with_fallback(eval_log, t_start, t_end) if eval_log else {"available": False},
+                "steps": _summarize_steps_with_fallback(eval_log, t_start, t_end) if eval_log else {"available": False},
+                "tasks": _summarize_tasks_from_trials(trials, t_start, t_end, args.num_trials) if trials_jsonl else {"available": False},
             }
 
     blob = json.dumps(out, ensure_ascii=False, indent=2)

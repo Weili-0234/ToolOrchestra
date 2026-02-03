@@ -61,8 +61,8 @@ fi
 
 echo ""
 echo "[Tunnels]"
-TUNNEL_COUNT="$(ss -lntp 2>/dev/null | egrep ':(1910|1911|1912|1913|1904|1905|1920|1921) ' | wc -l | tr -d ' ' || true)"
-echo "  forwarded_ports_listen: ${TUNNEL_COUNT} (expect 8 or 16)"
+TUNNEL_COUNT="$(ss -lntp 2>/dev/null | egrep ':(1910|1911|1912|1913|1904|1905|1906|1920) ' | wc -l | tr -d ' ' || true)"
+echo "  forwarded_ports_listen: ${TUNNEL_COUNT} (expect 8)"
 
 if [[ "${CHECK_EXPERT_HEALTH}" == "1" ]]; then
   for p in 1910 1904 1920; do

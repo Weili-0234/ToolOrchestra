@@ -458,6 +458,8 @@ set +e
 "${PYTHON_BIN}" "${SCRIPT_DIR}/summarize_hle_prefix_cache_window.py" \
   --metrics-csv "${METRICS_CSV}" \
   --usage-jsonl "${USAGE_JSONL}" \
+  --trials-jsonl "${OUTPUT_DIR}/outputs/trials.jsonl" \
+  --num-trials "${NUM_TRIALS}" \
   --eval-log "${LOG_DIR}/eval_driver.log" \
   --start-offset-sec "${WINDOW_START_SEC}" \
   --end-offset-sec "${WINDOW_END_SEC}" \
@@ -729,4 +731,3 @@ PY
 echo "[summarize] combined_json=${COMBINED_JSON}"
 echo "[summarize] report_md=${REPORT_MD}"
 echo "[done] HLE preexp run finished."
-

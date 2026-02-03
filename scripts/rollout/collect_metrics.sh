@@ -34,13 +34,27 @@ else
     done
 fi
 
-# Summarize throughput: tasks/min + steps/sec (step_complete PROFILE events)
+# Summarize throughput: tasks/sec + steps/sec (step_complete PROFILE events)
 if [[ -d "${LOG_DIR}" ]]; then
     echo "Summarizing rollout metrics..."
+    KV_THRESHOLD="${KV_THRESHOLD:-0.50}"
+    KV_CSV=""
+    if [[ -f "${OUTPUT_DIR}/kv_cache_timeseries.csv" ]]; then
+        KV_CSV="${OUTPUT_DIR}/kv_cache_timeseries.csv"
+    elif [[ -f "${OUTPUT_DIR}/metrics/kv_cache_usage.csv" ]]; then
+        KV_CSV="${OUTPUT_DIR}/metrics/kv_cache_usage.csv"
+    fi
+
+    KV_ARGS=()
+    if [[ -n "${KV_CSV}" ]]; then
+        KV_ARGS+=(--kv-csv "${KV_CSV}" --kv-threshold "${KV_THRESHOLD}")
+    fi
+
     python "${REPO_DIR}/scripts/rollout/summarize_rollout_metrics.py" \
         --log-dir "${LOG_DIR}" \
         --domains retail telecom airline \
         --out-json "${OUTPUT_DIR}/metrics/rollout_summary.json" \
+        "${KV_ARGS[@]}" \
         > "${OUTPUT_DIR}/metrics/rollout_summary_print.json" 2>/dev/null || true
 fi
 

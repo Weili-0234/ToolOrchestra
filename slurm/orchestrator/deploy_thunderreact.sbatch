@@ -4,7 +4,7 @@
 #SBATCH --nodes 1
 #SBATCH --gpus-per-node=8
 #SBATCH --exclusive
-#SBATCH --exclude=research-secure-18
+#SBATCH --exclude=research-secure-17,research-secure-18,research-secure-19
 #SBATCH --job-name rollout_orch_thunderreact
 #SBATCH --output=rollout_orch_thunderreact_%j.out
 #SBATCH --error=rollout_orch_thunderreact_%j.err
@@ -114,8 +114,7 @@ for i in 0 1 2 3 4 5 6 7; do
     VLLM_CACHE_ROOT="${INSTANCE_CACHE_DIR}/vllm" \
     vllm serve "${CKPT_DIR}" \
         --enable-auto-tool-choice \
-        --tool-call-parser llama3_json \
-        --chat-template "${TOOL_ORCH_DIR}/evaluation/tool_chat_template_llama3.1_json.jinja" \
+        --tool-call-parser hermes \
         --port "${port}" \
         --gpu-memory-utilization 0.95 \
         | tee "${LOG_DIR}/backend_${i}.log" 2>&1 &
