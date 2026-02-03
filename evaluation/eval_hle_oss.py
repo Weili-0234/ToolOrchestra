@@ -14,12 +14,12 @@
 # limitations under the License.
 
 """
-HLE Evaluation with OSS Expert Models
+HLE Evaluation with Mixed Expert Models
 
 Model Mapping:
-- All reasoners → Qwen/Qwen2.5-Coder-14B-Instruct (vLLM, TP=1, DP=8)
-- All search → openai/gpt-oss-20b (vLLM, TP=1, DP=4)
-- All answer (including math) → Qwen/Qwen3-32B-FP8 (vLLM, TP=1, DP=8, non-thinking mode)
+- All reasoners → gpt-5 (OpenAI)
+- All search → gpt-5-mini (OpenAI)
+- All answer (including math) → openai/gpt-oss-120b (Together)
 - LLM-as-judge → gpt-5 (proprietary, unchanged)
 """
 
@@ -78,44 +78,39 @@ with open('tools.json') as f:
     raw_tools = json.load(f)
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
 
-# OSS Expert Model Mapping
-# All tools map to OSS models served via vLLM
+# Expert Model Mapping
 MODEL_MAPPING = {
-    # All reasoners → Qwen2.5-Coder-14B-Instruct (DP=8)
-    "reasoner-1": "Qwen/Qwen2.5-Coder-14B-Instruct",
-    "reasoner-2": "Qwen/Qwen2.5-Coder-14B-Instruct",
-    "reasoner-3": "Qwen/Qwen2.5-Coder-14B-Instruct",
+    # All reasoners → gpt-5 (OpenAI)
+    "reasoner-1": "gpt-5",
+    "reasoner-2": "gpt-5",
+    "reasoner-3": "gpt-5",
 
-    # All search → GPT-OSS-20b (DP=4)
-    "search-1": "openai/gpt-oss-20b",
-    "search-2": "openai/gpt-oss-20b",
-    "search-3": "openai/gpt-oss-20b",
+    # All search → gpt-5-mini (OpenAI)
+    "search-1": "gpt-5-mini",
+    "search-2": "gpt-5-mini",
+    "search-3": "gpt-5-mini",
 
-    # All answer (including math) → Qwen3-32B-FP8 (non-thinking mode, DP=8)
-    "answer-1": "Qwen/Qwen3-32B-FP8",
-    "answer-2": "Qwen/Qwen3-32B-FP8",
-    "answer-3": "Qwen/Qwen3-32B-FP8",
-    "answer-4": "Qwen/Qwen3-32B-FP8",
-    "answer-math-1": "Qwen/Qwen3-32B-FP8",
-    "answer-math-2": "Qwen/Qwen3-32B-FP8",
+    # All answer (including math) → Together-hosted gpt-oss-120b
+    "answer-1": "openai/gpt-oss-120b",
+    "answer-2": "openai/gpt-oss-120b",
+    "answer-3": "openai/gpt-oss-120b",
+    "answer-4": "openai/gpt-oss-120b",
+    "answer-math-1": "openai/gpt-oss-120b",
+    "answer-math-2": "openai/gpt-oss-120b",
 }
 
 TOOL_PRICING = {
-    "Qwen/Qwen2.5-Coder-14B-Instruct": {
-        "input_tokens_per_million": 0.4/1000000,
-        "output_tokens_per_million": 0.4/1000000
-    },
-    "openai/gpt-oss-20b": {
-        "input_tokens_per_million": 0.3/1000000,
-        "output_tokens_per_million": 0.3/1000000
-    },
-    "Qwen/Qwen3-32B-FP8": {
-        "input_tokens_per_million": 0.6/1000000,
-        "output_tokens_per_million": 0.6/1000000
-    },
     "gpt-5": {
         "input_tokens_per_million": 1.25/1000000,
         "output_tokens_per_million": 10/1000000
+    },
+    "gpt-5-mini": {
+        "input_tokens_per_million": 0.25/10000000,
+        "output_tokens_per_million": 2/1000000
+    },
+    "openai/gpt-oss-120b": {
+        "input_tokens_per_million": 0.3/1000000,
+        "output_tokens_per_million": 0.3/1000000
     },
     "code_interpreter_per_second": 0.0000083,
     "tavily": {
@@ -164,7 +159,6 @@ def call_tool(arguments):
             _ = time.time()  # start_time (legacy; kept for compatibility)
 
             if arguments["tool"] == "enhance_reasoning":
-                # All reasoners use Qwen3-Coder-30B-A3B via vLLM
                 supported_models = [MODEL_MAPPING[m] for m in ALL_TOOLS["enhance_reasoning"]["model"]]
                 assert (
                     arguments["model"] in supported_models
@@ -177,20 +171,29 @@ def call_tool(arguments):
                     "Wrap the code within ```python and ```. The code should be self-contained with all the import and initialization."
                 )
                 model_name = arguments["model"]
+                arguments["messages"] = prompt
 
-                # Qwen3-Coder via vLLM - with timing
                 llm_t0 = time.perf_counter()
-                response = get_llm_response(
-                    model=model_name,
-                    messages=prompt,
-                    return_raw_response=True,
-                    model_type="vllm",
-                    max_length=8000,
-                    temperature=0.2,
-                    model_config=arguments["vllm_model_configs"][model_name],
-                    model_config_path=arguments["vllm_model_configs"]["vllm_model_config_path"],
-                    model_config_idx=arguments["eid"],
-                )
+                if "gpt-5" in model_name.lower():
+                    response = get_llm_response(
+                        model=model_name,
+                        messages=prompt,
+                        return_raw_response=True,
+                        max_length=40000,
+                        temperature=0.2,
+                    )
+                else:
+                    response = get_llm_response(
+                        model=model_name,
+                        messages=prompt,
+                        return_raw_response=True,
+                        model_type="vllm",
+                        max_length=8000,
+                        temperature=0.2,
+                        model_config=arguments["vllm_model_configs"][model_name],
+                        model_config_path=arguments["vllm_model_configs"]["vllm_model_config_path"],
+                        model_config_idx=arguments["eid"],
+                    )
                 arguments["_llm_ms"] = (time.perf_counter() - llm_t0) * 1000.0
 
                 if isinstance(response, str):
@@ -230,7 +233,6 @@ def call_tool(arguments):
                 return arguments
 
             if arguments["tool"] == "answer":
-                # All answer models use Qwen3-32B-FP8 via vLLM in non-thinking mode
                 prompt = arguments["context_str"].strip() + "\n\nProblem:\n" + arguments["problem"]
                 response_str = ""
                 pred = ""
@@ -239,26 +241,34 @@ def call_tool(arguments):
                 expert_t0 = time.perf_counter()
 
                 model_name = arguments["model"]
-                # Use <think>/<answer> format for structured output
                 prompt2 = (
                     prompt
                     + "\nWrap the thinking process and explanation between <think> and </think> and wrap only the exact answer without any explanation within <answer> and </answer>."
                 )
                 arguments["messages"] = prompt2
 
-                # Use vLLM for Qwen3-32B-FP8 with non-thinking mode
-                response = get_llm_response(
-                    model=model_name,
-                    messages=prompt2,
-                    return_raw_response=True,
-                    model_type="vllm",
-                    max_length=8000,
-                    temperature=0.2,
-                    model_config=arguments["vllm_model_configs"][model_name],
-                    model_config_path=arguments["vllm_model_configs"]["vllm_model_config_path"],
-                    model_config_idx=arguments["eid"],
-                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-                )
+                if "gpt-oss-120b" in model_name.lower():
+                    response = get_llm_response(
+                        model=model_name,
+                        messages=[{"role": "user", "content": prompt2}],
+                        return_raw_response=True,
+                        model_type="together",
+                        max_length=8000,
+                        temperature=0.2,
+                    )
+                else:
+                    response = get_llm_response(
+                        model=model_name,
+                        messages=prompt2,
+                        return_raw_response=True,
+                        model_type="vllm",
+                        max_length=8000,
+                        temperature=0.2,
+                        model_config=arguments["vllm_model_configs"][model_name],
+                        model_config_path=arguments["vllm_model_configs"]["vllm_model_config_path"],
+                        model_config_idx=arguments["eid"],
+                        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                    )
 
                 arguments["_expert_ms"] = (time.perf_counter() - expert_t0) * 1000.0
 
@@ -300,7 +310,6 @@ def call_tool(arguments):
                 return arguments
 
             if arguments["tool"] == "search":
-                # All search models use GPT-OSS-20b via vLLM
                 contents = []
                 prompt = arguments["context_str"].strip() + "\n\n"
                 prompt += (
@@ -311,18 +320,13 @@ def call_tool(arguments):
                 cur_query_writer = arguments["model"]
                 query_to_call = None
 
-                # GPT-OSS-20b via vLLM - with timing
                 query_llm_t0 = time.perf_counter()
                 response = get_llm_response(
                     model=cur_query_writer,
                     messages=[{"role": "user", "content": prompt}],
                     return_raw_response=True,
-                    model_type="vllm",
-                    max_length=8000,
+                    max_length=4000,
                     temperature=0.2,
-                    model_config=arguments["vllm_model_configs"][cur_query_writer],
-                    model_config_path=arguments["vllm_model_configs"]["vllm_model_config_path"],
-                    model_config_idx=arguments["eid"],
                 )
                 arguments["_query_llm_ms"] = (time.perf_counter() - query_llm_t0) * 1000.0
                 if isinstance(response, str):
@@ -911,7 +915,9 @@ if __name__=='__main__':
     with open(args.example_path) as f:
         lines = f.readlines()
     examples = []
-    for eid,l in enumerate(lines):
+    for eid, l in enumerate(lines):
+        if not l.strip():
+            continue
         raw_example = json.loads(l)
         raw_example['eid'] = eid
         examples.append([run_single,raw_example])

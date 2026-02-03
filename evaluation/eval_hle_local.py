@@ -97,23 +97,23 @@ def _together_model_for(model_name: str) -> str:
     return model_name
 
 MODEL_MAPPING = {
-    # All reasoners → Qwen/Qwen2.5-Coder-14B-Instruct (served via vLLM endpoints in model_config)
-    "reasoner-1": "Qwen/Qwen2.5-Coder-14B-Instruct",
-    "reasoner-2": "Qwen/Qwen2.5-Coder-14B-Instruct",
-    "reasoner-3": "Qwen/Qwen2.5-Coder-14B-Instruct",
+    # All reasoners → gpt-5 (OpenAI)
+    "reasoner-1": "gpt-5",
+    "reasoner-2": "gpt-5",
+    "reasoner-3": "gpt-5",
 
-    # All search → openai/gpt-oss-20b (served via vLLM endpoints in model_config)
-    "search-1": "openai/gpt-oss-20b",
-    "search-2": "openai/gpt-oss-20b",
-    "search-3": "openai/gpt-oss-20b",
+    # All search → gpt-5-mini (OpenAI)
+    "search-1": "gpt-5-mini",
+    "search-2": "gpt-5-mini",
+    "search-3": "gpt-5-mini",
 
-    # All answer (including math) → Qwen/Qwen3-32B-FP8 (served via vLLM endpoints in model_config)
-    "answer-1": "Qwen/Qwen3-32B-FP8",
-    "answer-2": "Qwen/Qwen3-32B-FP8",
-    "answer-3": "Qwen/Qwen3-32B-FP8",
-    "answer-4": "Qwen/Qwen3-32B-FP8",
-    "answer-math-1": "Qwen/Qwen3-32B-FP8",
-    "answer-math-2": "Qwen/Qwen3-32B-FP8",
+    # All answer (including math) → Together-hosted gpt-oss-120b
+    "answer-1": "openai/gpt-oss-120b",
+    "answer-2": "openai/gpt-oss-120b",
+    "answer-3": "openai/gpt-oss-120b",
+    "answer-4": "openai/gpt-oss-120b",
+    "answer-math-1": "openai/gpt-oss-120b",
+    "answer-math-2": "openai/gpt-oss-120b",
 }
 TOOL_PRICING = {
     "gpt-5": {
@@ -123,6 +123,10 @@ TOOL_PRICING = {
     "gpt-5-mini": {
         "input_tokens_per_million": 0.25/10000000,
         "output_tokens_per_million": 2/1000000
+    },
+    "openai/gpt-oss-120b": {
+        "input_tokens_per_million": 0.3/1000000,
+        "output_tokens_per_million": 0.3/1000000
     },
     "Qwen/Qwen3-32B": {
         "input_tokens_per_million": 0.8/1000000,
@@ -208,19 +212,29 @@ def call_tool(arguments):
                     "Wrap the code within ```python and ```. The code should be self-contained with all the import and initialization."
                 )
                 model_name = arguments["model"]
+                arguments["messages"] = prompt
 
                 llm_t0 = time.perf_counter()
-                response = get_llm_response(
-                    model=model_name,
-                    messages=prompt,
-                    return_raw_response=True,
-                    model_type="vllm",
-                    max_length=8000,
-                    temperature=0.2,
-                    model_config=arguments["vllm_model_configs"][model_name],
-                    model_config_path=arguments["vllm_model_configs"]["vllm_model_config_path"],
-                    model_config_idx=arguments["eid"],
-                )
+                if "gpt-5" in model_name.lower():
+                    response = get_llm_response(
+                        model=model_name,
+                        messages=prompt,
+                        return_raw_response=True,
+                        max_length=40000,
+                        temperature=0.2,
+                    )
+                else:
+                    response = get_llm_response(
+                        model=model_name,
+                        messages=prompt,
+                        return_raw_response=True,
+                        model_type="vllm",
+                        max_length=8000,
+                        temperature=0.2,
+                        model_config=arguments["vllm_model_configs"][model_name],
+                        model_config_path=arguments["vllm_model_configs"]["vllm_model_config_path"],
+                        model_config_idx=arguments["eid"],
+                    )
                 arguments["_llm_ms"] = (time.perf_counter() - llm_t0) * 1000.0
 
                 if isinstance(response, str):
@@ -345,6 +359,33 @@ def call_tool(arguments):
                     else:
                         pred = ""
 
+                elif "gpt-oss-120b" in arguments["model"].lower():
+                    model_name = arguments["model"]
+                    prompt2 = (
+                        prompt
+                        + "\nWrap the thinking process and explanation between <think> and </think> and wrap only the exact answer without any explanation within <answer> and </answer>."
+                    )
+                    arguments["messages"] = prompt2
+                    response = get_llm_response(
+                        model=model_name,
+                        messages=[{"role": "user", "content": prompt2}],
+                        return_raw_response=True,
+                        model_type="together",
+                        max_length=8000,
+                        temperature=0.2,
+                    )
+                    arguments["_expert_ms"] = (time.perf_counter() - expert_t0) * 1000.0
+                    if isinstance(response, str):
+                        arguments["response"] = ""
+                        arguments["pred"] = ""
+                        arguments["correctness"] = False
+                        return arguments
+                    response_str = response.choices[0].message.content
+                    if isinstance(response_str, str):
+                        pred = response_str.split("<answer>")[-1].split("</answer>")[0].strip()
+                    else:
+                        pred = ""
+
                 elif "llama-3.3" in arguments["model"].lower():
                     model_name = arguments["model"]
                     prompt2 = (
@@ -425,12 +466,8 @@ def call_tool(arguments):
                     model=cur_query_writer,
                     messages=[{"role": "user", "content": prompt}],
                     return_raw_response=True,
-                    model_type="vllm",
-                    max_length=8000,
+                    max_length=4000,
                     temperature=0.2,
-                    model_config=arguments["vllm_model_configs"][cur_query_writer],
-                    model_config_path=arguments["vllm_model_configs"]["vllm_model_config_path"],
-                    model_config_idx=arguments["eid"],
                 )
                 arguments["_query_llm_ms"] = (time.perf_counter() - query_llm_t0) * 1000.0
                 if isinstance(response, str):
@@ -1050,7 +1087,9 @@ if __name__=='__main__':
     with open(args.example_path) as f:
         lines = f.readlines()
     examples = []
-    for eid,l in enumerate(lines):
+    for eid, l in enumerate(lines):
+        if not l.strip():
+            continue
         raw_example = json.loads(l)
         raw_example['eid'] = eid
         examples.append([run_single,raw_example])

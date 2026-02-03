@@ -345,6 +345,15 @@ def get_openai_client(model, timeout_s: float | None = None):
         )
     return client
 
+
+def get_together_client(timeout_s: float | None = None) -> OpenAI:
+    api_key = os.getenv("TOGETHER_API_KEY")
+    if not api_key:
+        raise ValueError("TOGETHER_API_KEY is required for Together API calls.")
+    if timeout_s is None:
+        return OpenAI(api_key=api_key, base_url="https://api.together.xyz/v1")
+    return OpenAI(api_key=api_key, base_url="https://api.together.xyz/v1", timeout=timeout_s)
+
 def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,tools=None,show_messages=False,model_type=None,max_length=1024,model_config=None,model_config_idx=0,model_config_path=None,payload=None,**kwargs):
     if isinstance(messages,str):
         messages = [{'role': 'user','content': messages}]
@@ -534,11 +543,7 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                 raise LLMTimeoutError(f"Together call exceeded {call_timeout_s}s (req_id={req_id}, model={model})")
             retry_count += 1
             try:
-                oss_client = OpenAI(
-                    base_url="https://api.together.xyz/v1",
-                    api_key=os.getenv("TOGETHER_API_KEY"),
-                    timeout=(call_timeout_s or None),
-                )
+                oss_client = get_together_client(timeout_s=(call_timeout_s or None))
                 if tools:
                     chat_completion = oss_client.chat.completions.create(
                         model=model,
@@ -712,11 +717,7 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                     "attempt": retry_count,
                     "max_retries": max_retries,
                 })
-                oss_client = OpenAI(
-                    base_url = "https://api.together.xyz/v1",
-                    api_key = os.getenv("TOGETHER_API_KEY"),
-                    timeout=(call_timeout_s or None),
-                )
+                oss_client = get_together_client(timeout_s=(call_timeout_s or None))
                 if tools:
                     chat_completion = oss_client.chat.completions.create(
                         model=model, 
