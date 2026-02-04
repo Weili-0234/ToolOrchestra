@@ -117,7 +117,7 @@ source setup_envs.sh
 
 ## How to Run Experiments
 
-### Quick Start (Single Command)
+### Quick Start
 
 ```bash
 # Source environment variables first
@@ -126,24 +126,39 @@ source setup_envs.sh
 # Run baseline with concurrency=64
 bash evaluation/launch_hle_inference.sh \
     --method baseline \
-    --concurrency 64 \
-    --ckpt "$CKPT_DIR" \
-    --index-dir "$INDEX_DIR"
+    --concurrency 64
 
 # Run ThunderAgent with concurrency=64
 bash evaluation/launch_hle_inference.sh \
     --method thunderagent \
-    --concurrency 64 \
-    --ckpt "$CKPT_DIR" \
-    --index-dir "$INDEX_DIR"
+    --concurrency 64
 
 # Run Continuum with concurrency=64
 bash evaluation/launch_hle_inference.sh \
     --method continuum \
-    --concurrency 64 \
-    --ckpt "$CKPT_DIR" \
-    --index-dir "$INDEX_DIR"
+    --concurrency 64
 ```
+
+What this does by default:
+- Starts **retriever**, **vLLM backend**, and **ThunderAgent router** in one shot.
+- Enables prefix caching + prompt token details + usage logging on vLLM.
+- Starts metrics samplers for `/metrics` and GPU SM utilization.
+- Runs `eval_hle_local.py` with your `--concurrency`.
+- Writes output/logs to `evaluation/outputs/hle_local_YYYYMMDD_HHMMSS/` and
+  `evaluation/logs/hle_local_YYYYMMDD_HHMMSS/`.
+- Produces: `orchestrator_usage.jsonl`, `prefix_cache_timeseries.csv`,
+  `gpu_sm_util_timeseries.csv`, `window_summary.json`, `steps_summary.json`,
+  `combined_summary.json`.
+
+Defaults (you can override):
+- **No timeout** (runs to completion). Use `--eval-timeout-min 150` for 2h30.
+- **Active window**: `600–7800s` (10–130min). Change with
+  `--window-start-sec` / `--window-end-sec`.
+
+If you already exported `CKPT_DIR` and `INDEX_DIR`, you can omit those flags.
+
+To **summarize throughput and KV cache hit rates**, follow the steps in
+**Results & Metrics** below (it reads the artifacts produced here).
 
 ### Manual Step-by-Step
 
@@ -210,6 +225,65 @@ python eval_hle_local.py \
     --concurrency 64
 ```
 
+### Results & Metrics
+
+If you want **throughput (tasks/min, steps/sec)** and **KV cache hit rate**
+(`server_hit_ratio`, `request_hit_avg`, `request_hit_token_weighted`) with
+the default **10–130min active window**, use the HLE **serving** pipeline.
+This pipeline auto-starts a profile-enabled router (for `trnew`), enables
+`--enable-prefix-caching` and `--enable-prompt-tokens-details`, and writes
+the window summaries you need.
+
+#### 1) Run a 2h30 eval (or longer) with method + concurrency
+
+```bash
+# Required
+export CKPT_DIR=/path/to/Nemotron-Orchestrator-8B
+export INDEX_DIR=/path/to/index_dir_with_eval.index_and_eval.jsonl
+
+# 2h30 eval (150 minutes). Default is ~145 minutes if you omit this.
+export EVAL_TIMEOUT_MIN=150
+
+# Optional: change the active window (default 600..7800 seconds = 10–130min)
+export WINDOW_START_SEC=600
+export WINDOW_END_SEC=7800
+
+# Choose method + concurrency
+METHOD=baseline   # baseline | continuum | trnew
+CONCURRENCY=64
+
+# Run one setting
+bash scripts/hle_serving/run_hle_serving_one_w130.sh "${METHOD}" "${CONCURRENCY}" 1
+```
+
+This produces an output directory like:
+`outputs/hle_serving_5090_<method>_c<concurrency>_rep1_<timestamp>/`
+containing `window_summary.json`, `steps_summary.json`,
+`prefix_cache_timeseries.csv`, and `gpu_sm_util_timeseries.csv`.
+
+#### 2) Summarize metrics for the active window
+
+```bash
+python scripts/hle_serving/watch_hle_serving_metrics.py \
+  --scheduler "${METHOD}" \
+  --outputs-dir outputs \
+  --report-md "reports/hle_serving_${METHOD}_10_130.md" \
+  --window-start-sec "${WINDOW_START_SEC:-600}" \
+  --window-end-sec "${WINDOW_END_SEC:-7800}" \
+  --once
+```
+
+The report table includes:
+`trials/min` (tasks/min), `steps/sec`, `server_hit_ratio`,
+`request_hit_avg`, `request_hit_token_weighted`, `kv_usage_mean_perc`,
+`gpu_sm_util_mean`, plus latency and preemption stats.
+
+#### Local eval note
+
+For **local eval** runs via `evaluation/eval_hle_local.py`, only `eval.log`
+and per-task JSONs are produced, so KV cache hit rates are not available
+unless you use the serving pipeline (or add explicit usage logging).
+
 ### Launch Script Options
 
 ```
@@ -230,6 +304,15 @@ Common options:
   --router-port       ThunderAgent router port (default: 8000)
   --max-rounds        Max rounds per task (default: 50)
   --log-level         HLE log level (default: INFO)
+  --eval-timeout-min  Timeout minutes for eval (default: 0 = no timeout)
+  --window-start-sec  Active window start offset in seconds (default: 600)
+  --window-end-sec    Active window end offset in seconds (default: 7800)
+  --sample-interval-sec  Metrics sampling interval seconds (default: 2)
+
+Outputs (when using `evaluation/launch_hle_inference.sh`):
+- `prefix_cache_timeseries.csv`, `gpu_sm_util_timeseries.csv`
+- `window_summary.json`, `steps_summary.json`, `combined_summary.json`
+- `orchestrator_usage.jsonl` (used by window summaries)
 ```
 
 ## What We Changed for ThunderAgent Integration
