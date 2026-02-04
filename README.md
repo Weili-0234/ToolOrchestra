@@ -109,7 +109,7 @@ export CKPT_DIR='/path/to/Nemotron-Orchestrator-8B'
 cp setup_envs.sh_example setup_envs.sh
 
 # Edit setup_envs.sh with your paths and API keys:
-#   CKPT_DIR, INDEX_DIR, OPENAI_API_KEY, TOGETHER_API_KEY, TAVILY_KEY
+#   CKPT_DIR, INDEX_DIR, THUNDERAGENT_ROOT, OPENAI_API_KEY, TOGETHER_API_KEY, TAVILY_KEY
 
 # Source the environment
 source setup_envs.sh
@@ -123,24 +123,20 @@ source setup_envs.sh
 # Source environment variables first
 source setup_envs.sh
 
-# Choose method + concurrency
-METHOD=baseline   # baseline | continuum | thunderagent
-CONCURRENCY=64
+# Run one setting with defaults:
+#   METHOD=thunderagent, CONCURRENCY=48, EVAL_TIMEOUT_MIN=150
+#   WINDOW_START_SEC=600, WINDOW_END_SEC=7800
+./run_single_setting.sh
+```
 
-# Optional: run for 2h30 (150 min); default is no timeout
-EVAL_TIMEOUT_MIN=150
-
-# Optional: change the active window (default 600..7800 seconds = 10–130min)
-WINDOW_START_SEC=600
-WINDOW_END_SEC=7800
-
-# Run one setting (metrics + summaries are collected automatically)
-bash evaluation/launch_hle_inference.sh \
-  --method "${METHOD}" \
-  --concurrency "${CONCURRENCY}" \
-  --eval-timeout-min "${EVAL_TIMEOUT_MIN}" \
-  --window-start-sec "${WINDOW_START_SEC}" \
-  --window-end-sec "${WINDOW_END_SEC}"
+Override defaults (example):
+```bash
+export METHOD=baseline
+export CONCURRENCY=64
+export EVAL_TIMEOUT_MIN=180
+export WINDOW_START_SEC=900
+export WINDOW_END_SEC=9000
+./run_single_setting.sh
 ```
 
 What this does:
@@ -222,6 +218,7 @@ Common options:
   --window-start-sec  Active window start offset in seconds (default: 600)
   --window-end-sec    Active window end offset in seconds (default: 7800)
   --sample-interval-sec  Metrics sampling interval seconds (default: 2)
+  --thunderagent-root Path to ThunderAgent repo (default: /workspace/ThunderAgent or $THUNDERAGENT_ROOT; usually set explicitly)
 
 Outputs (when using `evaluation/launch_hle_inference.sh`):
 - `prefix_cache_timeseries.csv`, `gpu_sm_util_timeseries.csv`
@@ -248,7 +245,7 @@ program_id = f"hle:{e['id']}:{uuid.uuid4().hex[:8]}"
 response = get_llm_response(
     model=MODEL_NAME,
     messages=chat,
-    extra_body={"program_id": program_id, "job_id": program_id},
+    extra_body={"program_id": program_id},
 )
 ```
 

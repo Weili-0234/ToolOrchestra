@@ -38,6 +38,7 @@ Common options:
   --window-start-sec  Active window start offset in seconds (default: 600)
   --window-end-sec    Active window end offset in seconds (default: 7800)
   --sample-interval-sec  Metrics sampling interval seconds (default: 2)
+  --thunderagent-root Path to ThunderAgent repo (default: /workspace/ThunderAgent or $THUNDERAGENT_ROOT)
 USAGE
 }
 
@@ -65,6 +66,7 @@ MAX_ROUNDS=50
 LOG_LEVEL="DEBUG"
 VLLM_LOG_LEVEL="DEBUG"
 ROUTER_PROFILE=0
+THUNDERAGENT_ROOT="${THUNDERAGENT_ROOT:-/workspace/ThunderAgent}"
 EVAL_TIMEOUT_MIN=0
 WINDOW_START_SEC=600
 WINDOW_END_SEC=7800
@@ -100,6 +102,7 @@ while [[ $# -gt 0 ]]; do
     --window-start-sec) WINDOW_START_SEC="$2"; shift 2 ;;
     --window-end-sec) WINDOW_END_SEC="$2"; shift 2 ;;
     --sample-interval-sec) SAMPLE_INTERVAL_SEC="$2"; shift 2 ;;
+    --thunderagent-root) THUNDERAGENT_ROOT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1"; usage; exit 1 ;;
   esac
@@ -115,6 +118,11 @@ fi
 
 if [[ ! -f "$CONDA_SH" ]]; then
   echo "ERROR: conda.sh not found at $CONDA_SH (set --conda-sh)"
+  exit 1
+fi
+
+if [[ ! -d "$THUNDERAGENT_ROOT" ]]; then
+  echo "ERROR: ThunderAgent repo not found at $THUNDERAGENT_ROOT (set --thunderagent-root or THUNDERAGENT_ROOT)"
   exit 1
 fi
 
@@ -249,7 +257,7 @@ echo "Starting ThunderAgent router (mode=${ROUTER_MODE}, env=${ROUTER_ENV})..."
 (
   source "$CONDA_SH"
   conda activate "$ROUTER_ENV"
-  export PYTHONPATH="/workspace/ThunderAgent:${PYTHONPATH:-}"
+  export PYTHONPATH="${THUNDERAGENT_ROOT}:${PYTHONPATH:-}"
   python -m ThunderAgent \
     --host 0.0.0.0 \
     --port "${ROUTER_PORT}" \
