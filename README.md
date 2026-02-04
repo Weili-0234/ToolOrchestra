@@ -235,25 +235,26 @@ To integrate ThunderAgent with your own agent workflow, you need two key changes
 
 ### 1. Program ID Injection
 
-Location: [`evaluation/eval_hle_local.py`](evaluation/eval_hle_local.py) (`run_hle_trial()`).
+Location: [`evaluation/eval_hle_local.py`](evaluation/eval_hle_local.py) (`run_single()`).
 
 We give each HLE trial its own `program_id`, then attach it to every orchestrator call via `extra_body.program_id`. You can think of `program_id` as the thread label ThunderAgent uses to keep KV cache and pause/resume state isolated per task. Without it, trials can get mixed together.
 
 ```python
 # Create a unique program_id per HLE trial
-program_id = f"hle-{trial_id}"
+import uuid
+program_id = f"hle:{e['id']}:{uuid.uuid4().hex[:8]}"
 
 # Pass program_id in extra_body for every orchestrator request
-response = client.chat.completions.create(
-    model=model_name,
-    messages=messages,
-    extra_body={"program_id": program_id}
+response = get_llm_response(
+    model=MODEL_NAME,
+    messages=chat,
+    extra_body={"program_id": program_id, "job_id": program_id},
 )
 ```
 
 ### 2. Program Release Hook
 
-Location: [`evaluation/eval_hle_local.py`](evaluation/eval_hle_local.py) (`finally:` block).
+Location: [`evaluation/eval_hle_local.py`](evaluation/eval_hle_local.py) (end of `run_single()` via `_release_program()`).
 
 When a trial ends, we send `POST /programs/release` with that same `program_id`. This tells the router “you can forget this task now,” clearing KV/cache bookkeeping so finished trials don’t keep consuming capacity.
 
