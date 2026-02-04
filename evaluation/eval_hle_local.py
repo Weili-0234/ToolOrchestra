@@ -51,6 +51,7 @@ from hle_logging import (
     configure_hle_logging,
     log_profile_event,
     log_user_judge_event,
+    get_hle_logger,
     set_task_context,
     set_step_context,
     clear_task_context,
@@ -221,7 +222,7 @@ def call_tool(arguments):
                         messages=prompt,
                         return_raw_response=True,
                         max_length=40000,
-                        temperature=0.2,
+                        temperature=1,
                     )
                 else:
                     response = get_llm_response(
@@ -467,7 +468,7 @@ def call_tool(arguments):
                     messages=[{"role": "user", "content": prompt}],
                     return_raw_response=True,
                     max_length=4000,
-                    temperature=0.2,
+                    temperature=(1 if "gpt-5" in cur_query_writer.lower() else 0.2),
                 )
                 arguments["_query_llm_ms"] = (time.perf_counter() - query_llm_t0) * 1000.0
                 if isinstance(response, str):
@@ -650,9 +651,10 @@ async def run_all(
 
 def run_single(e):
     set_task_context(task_id=str(e.get("id", "unknown")), domain="hle", eid=e.get("eid") if isinstance(e.get("eid"), int) else None)
+    logger = get_hle_logger()
     out_path = os.path.join(my_output_dir, f"{e['id']}.json")
     if os.path.isfile(out_path):
-        print(f"[HLE_TASK_COMPLETE] id={e['id']} status=skipped", flush=True)
+        logger.info(f"[HLE_TASK_COMPLETE] id={e['id']} status=skipped")
         clear_task_context()
         return {"id": e["id"], "skipped": True}
     doc_list = []
@@ -1027,15 +1029,14 @@ def run_single(e):
     with open(os.path.join(my_output_dir,f"{e['id']}.json"),'w') as f:
         json.dump(return_dict,f,indent=2)
     if task_error_type:
-        print(f"[HLE_TASK_COMPLETE] id={e['id']} status={task_status} correct={final_correct} error_type={task_error_type}", flush=True)
+        logger.info(f"[HLE_TASK_COMPLETE] id={e['id']} status={task_status} correct={final_correct} error_type={task_error_type}")
     else:
-        print(f"[HLE_TASK_COMPLETE] id={e['id']} status={task_status} correct={final_correct}", flush=True)
+        logger.info(f"[HLE_TASK_COMPLETE] id={e['id']} status={task_status} correct={final_correct}")
     now = time.time()
     ts_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now))
-    print(
+    logger.info(
         f"[HLE_TRIAL_COMPLETE] ts_iso={ts_iso} ts_unix={now:.3f} task_id={e['id']} job_id={program_id} "
         f"status={task_status} correct={final_correct}",
-        flush=True,
     )
     clear_task_context()
     _release_program()

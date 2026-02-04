@@ -1028,6 +1028,41 @@ def get_llm_response(model,messages,temperature=1.0,return_raw_response=False,to
                         chat_completion.tau2_vllm_prompt_tokens = int(prompt_tokens or 0)
                         chat_completion.tau2_vllm_completion_tokens = int(completion_tokens or 0)
 
+                        # Optional: dump raw response for debugging (one-shot).
+                        debug_path = (os.getenv("HLE_DEBUG_RAW_RESP_PATH") or "").strip()
+                        if debug_path and not os.path.exists(debug_path):
+                            try:
+                                max_chars = int(os.getenv("HLE_DEBUG_RAW_RESP_MAX_CHARS", "4000") or 4000)
+                            except Exception:
+                                max_chars = 4000
+                            if max_chars <= 0:
+                                content_dump = content
+                            else:
+                                content_dump = content[:max_chars]
+                            try:
+                                with open(debug_path, "w", encoding="utf-8") as f:
+                                    json.dump(
+                                        {
+                                            "req_id": req_id,
+                                            "model": model,
+                                            "base_url": f"http://{ip_addr}:{port}/v1",
+                                            "content": content_dump,
+                                            "tool_calls": [
+                                                {
+                                                    "id": tc.id,
+                                                    "name": tc.function.name,
+                                                    "arguments": tc.function.arguments,
+                                                }
+                                                for tc in (tool_calls or [])
+                                            ],
+                                        },
+                                        f,
+                                        ensure_ascii=False,
+                                        indent=2,
+                                    )
+                            except Exception:
+                                pass
+
                         print(
                             f"DEBUG: vLLM stream complete (took {infer_ms/1000.0:.2f}s, ttft {prefill_ms/1000.0:.2f}s) req_id={req_id}",
                             flush=True,

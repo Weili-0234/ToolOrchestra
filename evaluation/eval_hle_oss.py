@@ -60,6 +60,7 @@ from hle_logging import (
     configure_hle_logging,
     log_profile_event,
     log_user_judge_event,
+    get_hle_logger,
     set_task_context,
     set_step_context,
     clear_task_context,
@@ -538,9 +539,10 @@ async def run_all(
 
 def run_single(e):
     set_task_context(task_id=str(e.get("id", "unknown")), domain="hle", eid=e.get("eid") if isinstance(e.get("eid"), int) else None)
+    logger = get_hle_logger()
     out_path = os.path.join(my_output_dir, f"{e['id']}.json")
     if os.path.isfile(out_path):
-        print(f"[HLE_TASK_COMPLETE] id={e['id']} status=skipped", flush=True)
+        logger.info(f"[HLE_TASK_COMPLETE] id={e['id']} status=skipped")
         clear_task_context()
         return {"id": e["id"], "skipped": True}
     doc_list = []
@@ -860,9 +862,9 @@ def run_single(e):
     with open(os.path.join(my_output_dir,f"{e['id']}.json"),'w') as f:
         json.dump(return_dict,f,indent=2)
     if task_error_type:
-        print(f"[HLE_TASK_COMPLETE] id={e['id']} status={task_status} correct={final_correct} error_type={task_error_type}", flush=True)
+        logger.info(f"[HLE_TASK_COMPLETE] id={e['id']} status={task_status} correct={final_correct} error_type={task_error_type}")
     else:
-        print(f"[HLE_TASK_COMPLETE] id={e['id']} status={task_status} correct={final_correct}", flush=True)
+        logger.info(f"[HLE_TASK_COMPLETE] id={e['id']} status={task_status} correct={final_correct}")
     clear_task_context()
     return return_dict
 

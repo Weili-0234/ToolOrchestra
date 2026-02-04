@@ -123,179 +123,93 @@ source setup_envs.sh
 # Source environment variables first
 source setup_envs.sh
 
-# Run baseline with concurrency=64
-bash evaluation/launch_hle_inference.sh \
-    --method baseline \
-    --concurrency 64
+# Choose method + concurrency
+METHOD=baseline   # baseline | continuum | thunderagent
+CONCURRENCY=64
 
-# Run ThunderAgent with concurrency=64
-bash evaluation/launch_hle_inference.sh \
-    --method thunderagent \
-    --concurrency 64
+# Optional: run for 2h30 (150 min); default is no timeout
+EVAL_TIMEOUT_MIN=150
 
-# Run Continuum with concurrency=64
+# Optional: change the active window (default 600..7800 seconds = 10–130min)
+WINDOW_START_SEC=600
+WINDOW_END_SEC=7800
+
+# Run one setting (metrics + summaries are collected automatically)
 bash evaluation/launch_hle_inference.sh \
-    --method continuum \
-    --concurrency 64
+  --method "${METHOD}" \
+  --concurrency "${CONCURRENCY}" \
+  --eval-timeout-min "${EVAL_TIMEOUT_MIN}" \
+  --window-start-sec "${WINDOW_START_SEC}" \
+  --window-end-sec "${WINDOW_END_SEC}"
 ```
 
-What this does by default:
+What this does:
 - Starts **retriever**, **vLLM backend**, and **ThunderAgent router** in one shot.
 - Enables prefix caching + prompt token details + usage logging on vLLM.
 - Starts metrics samplers for `/metrics` and GPU SM utilization.
 - Runs `eval_hle_local.py` with your `--concurrency`.
-- Writes output/logs to `evaluation/outputs/hle_local_YYYYMMDD_HHMMSS/` and
-  `evaluation/logs/hle_local_YYYYMMDD_HHMMSS/`.
+- Writes output to `evaluation/outputs/hle_local_YYYYMMDD_HHMMSS/`.
+- Writes logs to `evaluation/logs/hle_local_YYYYMMDD_HHMMSS/`.
 - Produces: `orchestrator_usage.jsonl`, `prefix_cache_timeseries.csv`,
   `gpu_sm_util_timeseries.csv`, `window_summary.json`, `steps_summary.json`,
   `combined_summary.json`.
 
-Defaults (you can override):
-- **No timeout** (runs to completion). Use `--eval-timeout-min 150` for 2h30.
-- **Active window**: `600–7800s` (10–130min). Change with
-  `--window-start-sec` / `--window-end-sec`.
-
-If you already exported `CKPT_DIR` and `INDEX_DIR`, you can omit those flags.
-
-To **summarize throughput and KV cache hit rates**, follow the steps in
-**Results & Metrics** below (it reads the artifacts produced here).
-
-### Manual Step-by-Step
-
-#### 1. Start Retriever (GPU 1)
+To inspect the latest run:
 ```bash
-conda activate retriever-clean
-CUDA_VISIBLE_DEVICES=1 python evaluation/retrieval_hle.py \
-    --port 1401 \
-    --new_cache_dir evaluation/cache/hle \
-    --example_id_file evaluation/examples.json
+LATEST_OUT=$(ls -td evaluation/outputs/hle_local_* | head -1)
+LATEST_LOG=$(ls -td evaluation/logs/hle_local_* | head -1)
+echo "$LATEST_OUT"
+echo "$LATEST_LOG"
 ```
 
-#### 2. Start vLLM Backend (GPU 0)
+To view throughput + KV cache hit rates for the active window:
 ```bash
-# For baseline/thunderagent:
-conda activate vllm1
-CUDA_VISIBLE_DEVICES=0 vllm serve "$CKPT_DIR" \
-    --port 8100 \
-    --enable-auto-tool-choice \
-    --tool-call-parser hermes
-
-# For continuum:
-conda activate vllm-continuum
-CUDA_VISIBLE_DEVICES=0 vllm serve "$CKPT_DIR" \
-    --port 8100 \
-    --enable-auto-tool-choice \
-    --tool-call-parser hermes \
-    --scheduling-policy continuum
+cat "$LATEST_OUT/combined_summary.json"
 ```
 
-#### 3. Start ThunderAgent Router
+To print key metrics from the latest run:
 ```bash
-conda activate vllm1
-export PYTHONPATH="/workspace/ThunderAgent:${PYTHONPATH:-}"
+python - <<'PY'
+import json, os, subprocess
 
-# For baseline/continuum (pure proxy mode):
-python -m ThunderAgent \
-    --backends http://localhost:8100 \
-    --port 8000 \
-    --router default \
-    --metrics
+latest_out = subprocess.check_output(
+    "ls -td evaluation/outputs/hle_local_* | head -1",
+    shell=True,
+    text=True,
+).strip()
 
-# For thunderagent (capacity scheduling):
-python -m ThunderAgent \
-    --backends http://localhost:8100 \
-    --port 8000 \
-    --router tr \
-    --metrics
+path = os.path.join(latest_out, "combined_summary.json")
+data = json.load(open(path, "r", encoding="utf-8"))
+
+window = data.get("windows", {}) or {}
+win_key = next(iter(window.keys()), None)
+metrics = (window.get(win_key, {}) or {}).get("metrics", {}) or {}
+usage = (window.get(win_key, {}) or {}).get("response_usage", {}) or {}
+steps = (data.get("steps") or {}).get("steps_per_sec")
+
+print("out_dir:", latest_out)
+print("window:", win_key)
+print("trials/min:", (window.get(win_key, {}) or {}).get("trials", {}).get("trials_per_sec", 0) * 60 if win_key else "n/a")
+print("steps/sec:", steps)
+print("server_hit_ratio:", metrics.get("hit_ratio"))
+print("request_hit_avg:", usage.get("cached_tokens_ratio_request_avg"))
+print("request_hit_token_weighted:", usage.get("cached_tokens_ratio_token_weighted"))
+print("kv_usage_mean_perc:", metrics.get("kv_cache_usage_mean_perc"))
+PY
 ```
-
-#### 4. Run Evaluation
-```bash
-conda activate vllm1
-export ROUTER_URL="http://127.0.0.1:8000"
-
-cd evaluation
-python eval_hle_local.py \
-    --model_name "$CKPT_DIR" \
-    --output_dir outputs/hle_local \
-    --model_config model_configs/hle_local_router.json \
-    --max_rounds 50 \
-    --model_type "Qwen/Qwen3-8B" \
-    --example_path hle.jsonl \
-    --concurrency 64
-```
-
-### Results & Metrics
-
-If you want **throughput (tasks/min, steps/sec)** and **KV cache hit rate**
-(`server_hit_ratio`, `request_hit_avg`, `request_hit_token_weighted`) with
-the default **10–130min active window**, use the HLE **serving** pipeline.
-This pipeline auto-starts a profile-enabled router (for `trnew`), enables
-`--enable-prefix-caching` and `--enable-prompt-tokens-details`, and writes
-the window summaries you need.
-
-#### 1) Run a 2h30 eval (or longer) with method + concurrency
-
-```bash
-# Required
-export CKPT_DIR=/path/to/Nemotron-Orchestrator-8B
-export INDEX_DIR=/path/to/index_dir_with_eval.index_and_eval.jsonl
-
-# 2h30 eval (150 minutes). Default is ~145 minutes if you omit this.
-export EVAL_TIMEOUT_MIN=150
-
-# Optional: change the active window (default 600..7800 seconds = 10–130min)
-export WINDOW_START_SEC=600
-export WINDOW_END_SEC=7800
-
-# Choose method + concurrency
-METHOD=baseline   # baseline | continuum | trnew
-CONCURRENCY=64
-
-# Run one setting
-bash scripts/hle_serving/run_hle_serving_one_w130.sh "${METHOD}" "${CONCURRENCY}" 1
-```
-
-This produces an output directory like:
-`outputs/hle_serving_5090_<method>_c<concurrency>_rep1_<timestamp>/`
-containing `window_summary.json`, `steps_summary.json`,
-`prefix_cache_timeseries.csv`, and `gpu_sm_util_timeseries.csv`.
-
-#### 2) Summarize metrics for the active window
-
-```bash
-python scripts/hle_serving/watch_hle_serving_metrics.py \
-  --scheduler "${METHOD}" \
-  --outputs-dir outputs \
-  --report-md "reports/hle_serving_${METHOD}_10_130.md" \
-  --window-start-sec "${WINDOW_START_SEC:-600}" \
-  --window-end-sec "${WINDOW_END_SEC:-7800}" \
-  --once
-```
-
-The report table includes:
-`trials/min` (tasks/min), `steps/sec`, `server_hit_ratio`,
-`request_hit_avg`, `request_hit_token_weighted`, `kv_usage_mean_perc`,
-`gpu_sm_util_mean`, plus latency and preemption stats.
-
-#### Local eval note
-
-For **local eval** runs via `evaluation/eval_hle_local.py`, only `eval.log`
-and per-task JSONs are produced, so KV cache hit rates are not available
-unless you use the serving pipeline (or add explicit usage logging).
 
 ### Launch Script Options
 
 ```
 Usage:
   bash evaluation/launch_hle_inference.sh --method <METHOD> --concurrency <C> \
-    --ckpt <CKPT_DIR> --index-dir <INDEX_DIR> [options]
+    [--ckpt <CKPT_DIR>] [--index-dir <INDEX_DIR>] [options]
 
 Required:
   --method         baseline | continuum | thunderagent
   --concurrency    HLE concurrency (eval batch size)
-  --ckpt           Orchestrator-8B checkpoint path
-  --index-dir      Directory containing eval.index + eval.jsonl
+  --ckpt           Orchestrator-8B checkpoint path (or set CKPT_DIR env)
+  --index-dir      Directory containing eval.index + eval.jsonl (or set INDEX_DIR env)
 
 Common options:
   --orchestrator-gpu  GPU for vLLM (default: 0)
@@ -323,9 +237,7 @@ To integrate ThunderAgent with your own agent workflow, you need two key changes
 
 Location: [`evaluation/eval_hle_local.py`](evaluation/eval_hle_local.py) (`run_hle_trial()`).
 
-**What**: Assign a unique `program_id` per HLE trial and pass it via `extra_body.program_id` on every orchestrator call.
-
-**Why**: ThunderAgent uses this field to separate requests into per-program state for KV cache management.
+We give each HLE trial its own `program_id`, then attach it to every orchestrator call via `extra_body.program_id`. You can think of `program_id` as the thread label ThunderAgent uses to keep KV cache and pause/resume state isolated per task. Without it, trials can get mixed together.
 
 ```python
 # Create a unique program_id per HLE trial
@@ -343,9 +255,7 @@ response = client.chat.completions.create(
 
 Location: [`evaluation/eval_hle_local.py`](evaluation/eval_hle_local.py) (`finally:` block).
 
-**What**: Send `POST /programs/release` to ThunderAgent with the same `program_id` after the trial finishes.
-
-**Why**: Frees router-side bookkeeping (tokens / pause-resume state) so finished programs do not linger.
+When a trial ends, we send `POST /programs/release` with that same `program_id`. This tells the router “you can forget this task now,” clearing KV/cache bookkeeping so finished trials don’t keep consuming capacity.
 
 ```python
 # After trial completes, release the program_id
