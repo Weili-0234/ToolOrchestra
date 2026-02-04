@@ -9,12 +9,13 @@
 # Example: export CKPT_DIR="/data/models/Orchestrator-8B"
 export CKPT_DIR="${CKPT_DIR:-}"
 export REPO_PATH="/workspace/ThunderAgent/examples/inference/ToolOrchestra"
+export THUNDERAGENT_ROOT="${THUNDERAGENT_ROOT:-}"  # repo root that contains ThunderAgent/ and evaluation/
 
 # HuggingFace cache directory
 # NOTE: In Runpod/containers, $HOME is often on the small overlay filesystem.
 # Default HF cache to /workspace to avoid hitting /root quota during datasets/model downloads.
 # Example: export HF_HOME="/data/huggingface_cache"
-export HF_HOME="${HF_HOME:-/workspace/cache/huggingface}"
+export HF_HOME="${HF_HOME:-}"
 export HF_TOKEN="${HF_TOKEN:-}"
 
 # User path for vLLM cache (used in original run.py)
@@ -46,6 +47,7 @@ echo "ToolOrchestra Environment Configuration (template)"
 echo "============================================================"
 echo "Paths:"
 echo "  REPO_PATH:  $REPO_PATH"
+echo "  THUNDERAGENT_ROOT: $THUNDERAGENT_ROOT"
 echo "  CKPT_DIR:   $CKPT_DIR"
 echo "  HF_HOME:    $HF_HOME"
 echo ""
